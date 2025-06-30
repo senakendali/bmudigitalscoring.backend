@@ -256,13 +256,14 @@ class TeamMemberController extends Controller
                 return response()->json(['error' => 'Unauthorized'], 401);
             }
 
-            // 🔗 Query awal + eager loading
+            // Query awal + eager loading
             $query = TeamMember::with([
                 'contingent.tournamentContingents.tournament.tournamentCategories',
                 'championshipCategory',
                 'matchCategory',
                 'ageCategory',
                 'categoryClass',
+                'tournamentParticipants',
             ]);
 
             // 🔍 Search
@@ -297,6 +298,16 @@ class TeamMemberController extends Controller
             if ($request->filled('category_class_id')) {
                 $query->where('category_class_id', $request->category_class_id);
             }
+
+            // 💳 Filter payment_status berdasarkan keikutsertaan peserta
+            if ($request->filled('payment_status')) {
+                if ($request->payment_status === 'paid') {
+                    $query->whereHas('tournamentParticipants');
+                } elseif ($request->payment_status === 'unpaid') {
+                    $query->whereDoesntHave('tournamentParticipants');
+                }
+            }
+
 
             // 🔐 Filter berdasarkan grup user
             if ($user->group && $user->group->name === 'Owner') {
@@ -366,11 +377,13 @@ class TeamMemberController extends Controller
         $matchCategoryId = $request->query('match_category_id');
         $ageCategoryId = $request->query('age_category_id');
         $categoryClassId = $request->query('category_class_id');
+        $paymentStatus = $request->query('payment_status');
 
         $query = TeamMember::with([
             'contingent.tournamentContingents.tournament',
             'championshipCategory',
-            'matchCategory'
+            'matchCategory',
+            'tournamentParticipants',
         ]);
 
         if ($search) {
@@ -399,6 +412,13 @@ class TeamMemberController extends Controller
         if ($categoryClassId) {
             $query->where('category_class_id', $categoryClassId);
         }
+
+        if ($paymentStatus === 'paid') {
+            $query->whereHas('tournamentParticipants');
+        } elseif ($paymentStatus === 'unpaid') {
+            $query->whereDoesntHave('tournamentParticipants');
+        }
+
 
         $teamMembers = $query->get();
 
