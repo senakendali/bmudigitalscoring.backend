@@ -2369,9 +2369,9 @@ public function export(Request $request)
 
             $lastOrderGlobal = \App\Models\MatchScheduleDetail::whereHas('schedule', function ($q) use ($request) {
                 $q->where('tournament_id', $request->tournament_id)
-                ->where('tournament_arena_id', $request->tournament_arena_id)
-                ->whereDate('scheduled_date', $request->scheduled_date);
+                ->where('tournament_arena_id', $request->tournament_arena_id); // ⬅️ Hapus whereDate
             })->max('order') ?? 0;
+
 
 
             foreach ($request->matches as $match) {
@@ -2417,136 +2417,7 @@ public function export(Request $request)
     }
 
 
-   public function store_asli(Request $request)
-    {
-        $request->validate([
-            'tournament_id' => 'required|exists:tournaments,id',
-            'tournament_arena_id' => 'required|exists:tournament_arena,id',
-            'match_category_id' => 'nullable|exists:match_categories,id',
-            'scheduled_date' => 'required|date',
-            'age_category_id' => 'nullable|exists:age_categories,id',
-            'round' => 'nullable|string',
-            'start_time' => 'required',
-            'end_time' => 'nullable',
-            'note' => 'nullable|string',
-            'matches' => 'required|array|min:1',
-            'matches.*.note' => 'nullable|string',
-            'matches.*.tournament_match_id' => 'nullable|exists:tournament_matches,id',
-            'matches.*.seni_match_id' => 'nullable|exists:seni_matches,id',
-            'matches.*.start_time' => 'nullable',
-        ]);
-
-        $tandingIds = collect($request->matches)
-            ->pluck('tournament_match_id')
-            ->filter()
-            ->toArray();
-
-        $exists = false;
-
-        if (!empty($tandingIds)) {
-            $exists = \App\Models\MatchScheduleDetail::whereIn('tournament_match_id', $tandingIds)
-                ->whereHas('schedule', function ($q) use ($request) {
-                    $q->where('tournament_id', $request->tournament_id)
-                        ->whereDate('scheduled_date', $request->scheduled_date);
-                })->exists();
-        }
-
-        if ($exists) {
-            return response()->json(['error' => 'Some matches are already scheduled on this date'], 422);
-        }
-
-        DB::beginTransaction();
-
-        try {
-
-            // ✅ Khusus untuk SENI: paksa isi age_category_id dan round_label
-            $hasSeni = collect($request->matches)
-                ->pluck('seni_match_id')
-                ->filter()
-                ->isNotEmpty();
-
-            if ($hasSeni) {
-                // Jika belum diset dari frontend, paksa isi
-                if (!$request->filled('age_category_id')) {
-                    $firstSeni = \App\Models\SeniMatch::find($request->matches[0]['seni_match_id']);
-                    if ($firstSeni) {
-                        $request->merge([
-                            'age_category_id' => $firstSeni->age_category_id ?? null,
-                        ]);
-                    }
-                }
-
-                // Paksa label jadi "Final"
-                $request->merge([
-                    'round_label' => 'Final',
-                ]);
-            }
-
-
-            $schedule = \App\Models\MatchSchedule::create([
-                'tournament_id' => $request->tournament_id,
-                'tournament_arena_id' => $request->tournament_arena_id,
-                'scheduled_date' => $request->scheduled_date,
-                'start_time' => $request->start_time,
-                'end_time' => $request->end_time,
-                'note' => $request->note,
-                'age_category_id' => $request->age_category_id,
-                'round_label' => $request->round_label,
-            ]);
-
-            $lastOrderTanding = \App\Models\MatchScheduleDetail::whereNotNull('tournament_match_id')
-                ->whereHas('schedule', function ($q) use ($request) {
-                    $q->where('tournament_id', $request->tournament_id)
-                        ->where('tournament_arena_id', $request->tournament_arena_id)
-                        ->whereDate('scheduled_date', $request->scheduled_date);
-                })->max('order') ?? 0;
-
-            $lastOrderSeni = \App\Models\MatchScheduleDetail::whereNotNull('seni_match_id')
-                ->whereHas('schedule', function ($q) use ($request) {
-                    $q->where('tournament_id', $request->tournament_id)
-                        ->where('tournament_arena_id', $request->tournament_arena_id)
-                        ->whereDate('scheduled_date', $request->scheduled_date);
-                })->max('order') ?? 0;
-
-            foreach ($request->matches as $match) {
-                $data = [
-                    'start_time' => $match['start_time'] ?? null,
-                    'note' => $match['note'] ?? null,
-                    'match_category_id' => $request->match_category_id,
-                    'round_label' => $request->round_label,
-                ];
-
-                if (!empty($match['tournament_match_id'])) {
-                    $data['tournament_match_id'] = $match['tournament_match_id'];
-                    $data['order'] = ++$lastOrderTanding;
-                }
-
-                if (!empty($match['seni_match_id'])) {
-                    $seni = \App\Models\SeniMatch::find($match['seni_match_id']);
-                    if ($seni) {
-                        $data['seni_match_id'] = $seni->id;
-                        $data['match_category_id'] = $seni->match_category_id;
-                        $data['order'] = ++$lastOrderSeni;
-                    }
-                }
-
-                $schedule->details()->create($data);
-            }
-
-            DB::commit();
-
-            return response()->json([
-                'message' => 'Match schedule created successfully',
-                'data' => $schedule->load('details')
-            ], 201);
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'error' => 'Failed to create match schedule',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
+   
 
 
 
