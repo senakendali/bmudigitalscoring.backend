@@ -160,6 +160,7 @@ Route::post('/matches/{pool}/create-dummy', [DrawingController::class, 'createDu
 
 Route::get('pools', [DrawingController::class, 'getPools']);
 Route::get('pools/{poolId}/match-list', [DrawingController::class, 'getMatchList']);
+Route::get('matches-recap', [DrawingController::class, 'getAllMatchRecap']);
 Route::get('pools/{poolId}', [DrawingController::class, 'detailPool']);
 Route::apiResource('drawings', DrawingController::class);
 

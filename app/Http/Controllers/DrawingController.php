@@ -1009,6 +1009,54 @@ class DrawingController extends Controller
         ]);
     }
 
+    public function getAllMatchRecap(Request $request)
+    {
+        $tournamentId = $request->query('tournament_id');
+
+        $matches = TournamentMatch::with([
+            'pool:id,name,tournament_id,category_class_id,age_category_id',
+            'pool.ageCategory:id,name',
+            'pool.categoryClass:id,name,gender,weight_min,weight_max',
+            'participantOne:id,name,contingent_id',
+            'participantOne.contingent:id,name',
+            'participantTwo:id,name,contingent_id',
+            'participantTwo.contingent:id,name',
+            'winner:id,name,contingent_id',
+            'winner.contingent:id,name'
+        ])
+        ->whereHas('pool', function ($query) use ($tournamentId) {
+            if ($tournamentId) {
+                $query->where('tournament_id', $tournamentId);
+            }
+        })
+        ->get();
+
+        $grouped = [];
+
+        foreach ($matches as $match) {
+            $age = $match->pool->ageCategory->name ?? 'Tanpa Usia';
+            $gender = $match->pool->categoryClass->gender ?? 'unknown';
+            $pool = $match->pool->name ?? 'Tanpa Pool';
+            $kelas = $match->pool->categoryClass->name ?? 'Gabungan Kelas';
+
+            $grouped[$age][$gender][$pool][$kelas][] = [
+                'match_id' => $match->id,
+                'round' => $match->round_label,
+                'participant_one_contingent' => $match->participantOne->contingent->name ?? '-',
+                'participant_two_contingent' => $match->participantTwo->contingent->name ?? '-',
+                'participant_one' => $match->participantOne->name ?? '-',
+                'participant_two' => $match->participantTwo->name ?? '-',
+                'winner' => $match->winner->name ?? '-',
+                'winner_contingent' => $match->winner->contingent->name ?? '-',
+            ];
+        }
+
+        return response()->json([
+            'status' => 'success',
+            'data' => $grouped
+        ]);
+    }
+
 
 
 
