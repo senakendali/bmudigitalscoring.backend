@@ -603,6 +603,7 @@ class TournamentMatchController extends Controller
         return response()->json(['message' => 'Pool tidak memiliki kelas atau kategori pertandingan.'], 400);
     }
 
+    // Ambil peserta sesuai turnamen, kelas, dan kategori
     $eligibleParticipants = DB::table('tournament_participants')
         ->join('team_members', 'tournament_participants.team_member_id', '=', 'team_members.id')
         ->where('tournament_participants.tournament_id', $tournamentId)
@@ -617,7 +618,10 @@ class TournamentMatchController extends Controller
         ->get();
 
     // Reset pool_id peserta
-    DB::table('tournament_participants')->where('pool_id', $poolId)->update(['pool_id' => null]);
+    DB::table('tournament_participants')
+        ->where('tournament_id', $tournamentId)
+        ->where('pool_id', $poolId)
+        ->update(['pool_id' => null]);
 
     $shuffled = $eligibleParticipants->shuffle()->values();
     $participantIdsToUpdate = $shuffled->pluck('tp_id');
@@ -693,14 +697,15 @@ class TournamentMatchController extends Controller
         }
     }
 
-    // === Pairing preliminary (beda kontingen diprioritaskan) ===
+    // Pairing beda kontingen hanya dari peserta turnamen ini
     $firstRoundMatchIndexes = array_keys(array_filter($matches, fn($m) => $m['round'] === 1));
 
-    // ✅ Pastiin team_member yang diambil hanya dari turnamen ini
     $teamMembers = DB::table('team_members')
-        ->join('tournament_participants', 'team_members.id', '=', 'tournament_participants.team_member_id')
+        ->join('tournament_participants', function ($join) use ($tournamentId) {
+            $join->on('team_members.id', '=', 'tournament_participants.team_member_id')
+                ->where('tournament_participants.tournament_id', $tournamentId);
+        })
         ->whereIn('team_members.id', $participantIds)
-        ->where('tournament_participants.tournament_id', $tournamentId)
         ->select('team_members.id', 'team_members.contingent_id')
         ->get()
         ->keyBy('id');
@@ -750,7 +755,7 @@ class TournamentMatchController extends Controller
         $matches[$index]['participant_2'] = $pair[1] ?? null;
     }
 
-    // === BYE ===
+    // BYE
     $remainingIds = array_values(array_diff($participantIds->all(), $used));
     $byeTargets = array_slice($firstRoundMatchIndexes, $preliminaryMatches);
 
@@ -762,7 +767,7 @@ class TournamentMatchController extends Controller
 
     DB::table('tournament_matches')->insert($matches);
 
-    // === Link parent-child match ===
+    // Link parent-child match
     $matchMap = TournamentMatch::where('pool_id', $poolId)->orderBy('match_number')->get();
     $roundGroups = $matchMap->groupBy('round');
 
@@ -810,6 +815,7 @@ class TournamentMatchController extends Controller
         'rounds_generated' => $maxRound,
     ]);
 }
+
 
 
 
