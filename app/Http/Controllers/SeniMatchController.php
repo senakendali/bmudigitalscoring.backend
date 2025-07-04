@@ -548,12 +548,6 @@ class SeniMatchController extends Controller
 
         return response()->json($grouped);
     }
-
-
-
-
-
-
     
     public function generate(Request $request)
     {
@@ -670,6 +664,138 @@ class SeniMatchController extends Controller
 
         return response()->json(['message' => 'Seni matches created or updated successfully.']);
     }
+
+    public function regenerate(Request $request)
+    {
+        $tournamentId = $request->tournament_id;
+        $matchCategoryId = $request->match_category_id;
+        $ageCategoryId = $request->age_category_id;
+        $gender = $request->gender;
+
+        $requiredMembers = match ($matchCategoryId) {
+            3 => 2, // Ganda
+            4 => 3, // Regu
+            default => 1, // Tunggal / Solo Kreatif
+        };
+
+        // ✅ Ambil pool yang sudah ada
+        $existingPools = \App\Models\SeniPool::where([
+            'tournament_id' => $tournamentId,
+            'match_category_id' => $matchCategoryId,
+            'age_category_id' => $ageCategoryId,
+            'gender' => $gender,
+        ])->get();
+
+        if ($existingPools->isEmpty()) {
+            return response()->json(['message' => 'Tidak ada pool yang tersedia.'], 404);
+        }
+
+        // ✅ Hapus match lama di dalam pool yang ditemukan
+        $poolIds = $existingPools->pluck('id');
+        \App\Models\SeniMatch::whereIn('pool_id', $poolIds)->delete();
+
+        // ✅ Ambil semua peserta dari tournament_participants
+        $participants = \App\Models\TournamentParticipant::where('tournament_id', $tournamentId)
+            ->whereHas('participant', function ($q) use ($matchCategoryId, $ageCategoryId, $gender) {
+                $q->where('match_category_id', $matchCategoryId)
+                ->where('age_category_id', $ageCategoryId)
+                ->where('gender', $gender);
+            })
+            ->with('participant')
+            ->get()
+            ->filter(fn($tp) => $tp->participant !== null);
+
+        if ($participants->isEmpty()) {
+            return response()->json(['message' => 'Tidak ada peserta ditemukan.'], 404);
+        }
+
+        // ✅ Shuffle dengan prioritas beda kontingen
+        $availableUnits = [];
+
+        if ($requiredMembers === 1) {
+            $availableUnits = $participants->shuffle()->values();
+
+        } else {
+            $remaining = $participants->shuffle()->values();
+
+            while ($remaining->count() >= $requiredMembers) {
+                $unit = collect();
+                $usedContingents = [];
+
+                foreach ($remaining as $p) {
+                    $contingentId = $p->participant->contingent_id;
+                    if (in_array($contingentId, $usedContingents)) continue;
+
+                    $unit->push($p);
+                    $usedContingents[] = $contingentId;
+
+                    if ($unit->count() === $requiredMembers) break;
+                }
+
+                // kalau kurang dari requiredMembers, ambil dari tim sendiri
+                if ($unit->count() < $requiredMembers) {
+                    $unit = $remaining->take($requiredMembers);
+                }
+
+                $availableUnits[] = $unit;
+
+                foreach ($unit as $used) {
+                    $remaining = $remaining->reject(fn($r) => $r->id === $used->id)->values();
+                }
+            }
+        }
+
+        // ✅ Distribusi ulang ke pool yang sudah ada
+        $poolSize = intval(floor(count($availableUnits) / $existingPools->count())) ?: 1;
+
+        $chunks = collect($availableUnits)->chunk($poolSize)->values();
+
+        foreach ($existingPools as $i => $pool) {
+            $chunk = $chunks[$i] ?? collect();
+
+            foreach ($chunk->values() as $index => $unit) {
+                if ($requiredMembers === 1) {
+                    $p = $unit->participant;
+
+                    \App\Models\SeniMatch::create([
+                        'pool_id' => $pool->id,
+                        'match_order' => $index + 1,
+                        'gender' => $gender,
+                        'match_category_id' => $matchCategoryId,
+                        'match_type' => 'seni_tunggal',
+                        'contingent_id' => $p->contingent_id,
+                        'team_member_1' => $p->id,
+                    ]);
+
+                } else {
+                    $members = $unit->pluck('participant')->filter()->values();
+                    $memberIds = $members->pluck('id');
+
+                    $matchData = [
+                        'pool_id' => $pool->id,
+                        'match_order' => $index + 1,
+                        'gender' => $gender,
+                        'match_category_id' => $matchCategoryId,
+                        'match_type' => match ($matchCategoryId) {
+                            3 => 'seni_ganda',
+                            4 => 'seni_regu',
+                        },
+                        'contingent_id' => $members[0]->contingent_id,
+                        'team_member_1' => $memberIds[0],
+                    ];
+
+                    if ($requiredMembers >= 2) $matchData['team_member_2'] = $memberIds[1];
+                    if ($requiredMembers === 3) $matchData['team_member_3'] = $memberIds[2];
+
+                    \App\Models\SeniMatch::create($matchData);
+                }
+            }
+        }
+
+        return response()->json(['message' => 'Peserta berhasil di-regenerate.']);
+    }
+
+
 
     public function getParticipantCounts(Request $request)
     {
