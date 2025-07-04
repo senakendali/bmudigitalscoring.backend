@@ -338,10 +338,76 @@ class SyncController extends Controller
         };
     }
 
+    public function seniMatches(Request $request) 
+    {
+        $tournamentSlug = $request->query('tournament');
+        $tournament = \App\Models\Tournament::where('slug', $tournamentSlug)->firstOrFail();
+
+        $details = \App\Models\MatchScheduleDetail::with([
+            'schedule.arena',
+            'schedule.tournament',
+            'seniMatch.contingent',
+            'seniMatch.teamMember1',
+            'seniMatch.teamMember2',
+            'seniMatch.teamMember3',
+            'seniMatch.pool.ageCategory',
+            'seniMatch.pool.tournament',
+            'seniMatch.matchCategory',
+        ])
+        ->whereHas('schedule', fn($q) => $q->where('tournament_id', $tournament->id))
+        ->whereHas('seniMatch')
+        ->get();
+
+        $result = $details->map(function ($detail) {
+            $match = $detail->seniMatch;
+            if (!$match) return null;
+
+            return [
+                'remote_match_id'     => $match->id,
+                'remote_contingent_id'=> $match->contingent_id,
+                'remote_team_member_1'=> $match->team_member_1,
+                'remote_team_member_2'=> $match->team_member_2,
+                'remote_team_member_3'=> $match->team_member_3,
+
+                'tournament_name'     => $match->pool->tournament->name ?? '-',
+                'arena_name'          => $detail->schedule->arena->name ?? '-',
+                'match_date'          => $detail->schedule->scheduled_date,
+                'match_time'          => $detail->schedule->start_time,
+                'pool_name'           => $match->pool->name ?? '-',
+
+                'match_number'        => $detail->order,
+                'match_order'         => $detail->order,
+
+                'category' => match ($match->match_category_id) {
+                    2 => 'Tunggal',
+                    3 => 'Ganda',
+                    4 => 'Regu',
+                    5 => 'Solo Kreatif',
+                    default => 'Unknown',
+                },
+                'match_type' => match ($match->match_category_id) {
+                    2 => 'seni_tunggal',
+                    3 => 'seni_ganda',
+                    4 => 'seni_regu',
+                    5 => 'solo_kreatif',
+                    default => 'unknown',
+                },
+                'gender'           => $match->gender,
+                'contingent_name'  => $match->contingent?->name ?? 'TBD',
+                'participant_1'    => $match->teamMember1?->name ?? null,
+                'participant_2'    => $match->teamMember2?->name ?? null,
+                'participant_3'    => $match->teamMember3?->name ?? null,
+                'age_category'     => $match->pool->ageCategory->name ?? '-',
+                'final_score'      => null,
+            ];
+        })->filter(); // buang null jika ada
+
+        return response()->json($result->values());
+    }
 
 
 
-   public function seniMatches(Request $request) 
+   public function seniMatches__(Request $request) 
     {
         $tournamentSlug = $request->query('tournament');
 
