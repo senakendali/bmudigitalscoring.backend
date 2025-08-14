@@ -11,6 +11,7 @@ class SeniPool extends Model
         'age_category_id',
         'match_category_id',
         'gender',
+        'bracket_type',
         'name',
     ];
 

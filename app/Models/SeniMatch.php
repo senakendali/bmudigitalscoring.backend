@@ -20,7 +20,17 @@ class SeniMatch extends Model
         'team_member_2',
         'team_member_3',
         'final_score',
+
+        // 🔹 tambahan untuk battle mode
+        'mode',
+        'battle_group',
+        'round',
+        'corner',
+        'parent_match_red_id',
+        'parent_match_blue_id',
+        'status',
     ];
+
 
     public function tournament()
     {

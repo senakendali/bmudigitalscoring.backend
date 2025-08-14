@@ -551,43 +551,14 @@ class SeniMatchController extends Controller
     
     public function generate(Request $request)
     {
-        // Rule umum
-        $rules = [
+        $validated = $request->validate([
             'tournament_id' => 'required|exists:tournaments,id',
             'match_category_id' => 'required|in:2,3,4,5',
             'age_category_id' => 'required|exists:age_categories,id',
             'gender' => 'required|in:male,female',
-            'mode' => 'required|in:default,battle',
-        ];
+            'pool_size' => 'required|integer|min:1',
+        ]);
 
-        // Kalau mode default → wajib pool_size
-        if ($request->mode === 'default') {
-            $rules['pool_size'] = 'required|integer|min:1';
-        }
-
-        // Kalau mode battle → wajib bracket_type
-        if ($request->mode === 'battle') {
-            $rules['bracket_type'] = 'required|in:2,4,8,16,full_prestasi';
-        }
-
-        $validated = $request->validate($rules);
-
-        if ($validated['mode'] === 'default') {
-            return $this->generatePoolMode($validated);
-        } else {
-            return $this->generateBattleMode($validated);
-        }
-    }
-
-
-
-    /**
-     * =========================
-     * MODE DEFAULT (POOL / URUTAN)
-     * =========================
-     */
-    protected function generatePoolMode($validated)
-    {
         // Hapus data lama
         $existingPools = \App\Models\SeniPool::where('tournament_id', $validated['tournament_id'])
             ->where('match_category_id', $validated['match_category_id'])
@@ -622,8 +593,10 @@ class SeniMatchController extends Controller
         $usedMemberIds = [];
 
         if ($matchCategory === 2 || $matchCategory === 5) {
+            // TUNGGAL
             $units = $participants->shuffle()->values();
         } else {
+            // GANDA / REGU
             $units = $participants
                 ->groupBy(fn($tp) => $tp->participant->contingent_id)
                 ->filter(fn($group) => $group->count() >= $requiredMembers)
@@ -689,196 +662,8 @@ class SeniMatchController extends Controller
             }
         }
 
-        return response()->json(['message' => 'Seni matches created (pool mode) successfully.']);
+        return response()->json(['message' => 'Seni matches created or updated successfully.']);
     }
-
-    /**
-     * =========================
-     * MODE BATTLE (BRACKET)
-     * =========================
-     */
-   protected function generateBattleMode(array $validated)
-{
-    // Hapus pool & match lama
-    $oldPools = SeniPool::where('tournament_id', $validated['tournament_id'])
-        ->where('match_category_id', $validated['match_category_id'])
-        ->where('age_category_id', $validated['age_category_id'])
-        ->where('gender', $validated['gender'])
-        ->pluck('id');
-
-    if ($oldPools->isNotEmpty()) {
-        SeniMatch::whereIn('pool_id', $oldPools)->delete();
-        SeniPool::whereIn('id', $oldPools)->delete();
-    }
-
-    // Ambil peserta
-    $participants = TournamentParticipant::where('tournament_id', $validated['tournament_id'])
-        ->whereHas('participant', function ($query) use ($validated) {
-            $query->where('match_category_id', $validated['match_category_id'])
-                ->where('age_category_id', $validated['age_category_id'])
-                ->where('gender', $validated['gender']);
-        })
-        ->with('participant')
-        ->get()
-        ->filter(fn($tp) => $tp->participant !== null)
-        ->values();
-
-    if ($participants->isEmpty()) {
-        return response()->json(['message' => 'No participants found.'], 404);
-    }
-
-    // Tentukan ukuran bracket
-    $bracketSize = $validated['bracket_type'] === 'full_prestasi'
-        ? pow(2, ceil(log(count($participants), 2)))
-        : (int) $validated['bracket_type'];
-
-    // Bagi ke pool
-    $pools = $participants->shuffle()->chunk($bracketSize);
-
-    $matchTypeMap = [
-        2 => 'seni_tunggal',
-        3 => 'seni_ganda',
-        4 => 'seni_regu',
-        5 => 'solo_kreatif',
-    ];
-    $matchType = $matchTypeMap[$validated['match_category_id']] ?? 'seni_tunggal';
-
-    foreach ($pools as $i => $chunk) {
-        $pool = SeniPool::create([
-            'tournament_id' => $validated['tournament_id'],
-            'match_category_id' => $validated['match_category_id'],
-            'age_category_id' => $validated['age_category_id'],
-            'gender' => $validated['gender'],
-            'name' => 'Pool ' . ($i + 1),
-            'mode' => 'battle',
-            'bracket_type' => $validated['bracket_type'],
-        ]);
-
-        // Tambah BYE jika kurang dari bracket size
-        while ($chunk->count() < $bracketSize) {
-            $chunk->push((object)['participant' => null]);
-        }
-
-        // Pair peserta beda kontingen lebih dulu
-        $pairings = [];
-        while ($chunk->count() > 0) {
-            $blue = $chunk->shift();
-            $matchFound = false;
-
-            foreach ($chunk as $idx => $red) {
-                if (
-                    $blue->participant === null || $red->participant === null ||
-                    ($blue->participant->contingent_id ?? null) !== ($red->participant->contingent_id ?? null)
-                ) {
-                    $pairings[] = [$blue, $red];
-                    $chunk->forget($idx);
-                    $chunk = $chunk->values();
-                    $matchFound = true;
-                    break;
-                }
-            }
-
-            if (!$matchFound) {
-                $pairings[] = [$blue, $chunk->shift()];
-            }
-        }
-
-        // Buat pertandingan
-        $round = 1;
-        $battleGroup = 1;
-        $currentRoundMatches = [];
-
-        foreach ($pairings as [$blue, $red]) {
-            $blueMatch = SeniMatch::create([
-                'pool_id' => $pool->id,
-                'match_order' => $battleGroup,
-                'battle_group' => $battleGroup,
-                'gender' => $validated['gender'],
-                'match_category_id' => $validated['match_category_id'],
-                'match_type' => $matchType,
-                'mode' => 'battle',
-                'round' => $round,
-                'corner' => 'blue',
-                'contingent_id' => $blue->participant->contingent_id ?? null,
-                'team_member_1' => $blue->participant->id ?? null,
-                'status' => 'not_started',
-            ]);
-
-            $redMatch = SeniMatch::create([
-                'pool_id' => $pool->id,
-                'match_order' => $battleGroup,
-                'battle_group' => $battleGroup,
-                'gender' => $validated['gender'],
-                'match_category_id' => $validated['match_category_id'],
-                'match_type' => $matchType,
-                'mode' => 'battle',
-                'round' => $round,
-                'corner' => 'red',
-                'contingent_id' => $red->participant->contingent_id ?? null,
-                'team_member_1' => $red->participant->id ?? null,
-                'status' => 'not_started',
-            ]);
-
-            $currentRoundMatches[] = [$redMatch->id, $blueMatch->id];
-            $battleGroup++;
-        }
-
-        // Round berikutnya
-        while (count($currentRoundMatches) > 1) {
-            $round++;
-            $nextRound = [];
-
-            for ($j = 0; $j < count($currentRoundMatches); $j += 2) {
-                $blueParent = $currentRoundMatches[$j][1];
-                $redParent = $currentRoundMatches[$j + 1][0] ?? null;
-
-                $blueMatch = SeniMatch::create([
-                    'pool_id' => $pool->id,
-                    'match_order' => $battleGroup,
-                    'battle_group' => $battleGroup,
-                    'gender' => $validated['gender'],
-                    'match_category_id' => $validated['match_category_id'],
-                    'match_type' => $matchType,
-                    'mode' => 'battle',
-                    'round' => $round,
-                    'corner' => 'blue',
-                    'parent_match_blue_id' => $blueParent,
-                    'status' => 'not_started',
-                ]);
-
-                $redMatch = SeniMatch::create([
-                    'pool_id' => $pool->id,
-                    'match_order' => $battleGroup,
-                    'battle_group' => $battleGroup,
-                    'gender' => $validated['gender'],
-                    'match_category_id' => $validated['match_category_id'],
-                    'match_type' => $matchType,
-                    'mode' => 'battle',
-                    'round' => $round,
-                    'corner' => 'red',
-                    'parent_match_red_id' => $redParent,
-                    'status' => 'not_started',
-                ]);
-
-                $nextRound[] = [$redMatch->id, $blueMatch->id];
-                $battleGroup++;
-            }
-
-            $currentRoundMatches = $nextRound;
-        }
-    }
-
-    return response()->json(['message' => 'Battle matches generated with optimal pairing.']);
-}
-
-
-
-
-
-
-
-
-
 
     public function regenerate(Request $request)
     {
