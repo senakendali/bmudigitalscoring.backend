@@ -338,22 +338,10 @@ class SyncController extends Controller
         };
     }
 
-    public function seniMatches(Request $request)
+    public function seniMatches(Request $request) 
     {
         $tournamentSlug = $request->query('tournament');
         $tournament = \App\Models\Tournament::where('slug', $tournamentSlug)->firstOrFail();
-
-        // Fallback mapper priority berdasarkan label (kalau DB belum punya round_priority)
-        $priorityMap = [
-            'final'       => 1000,
-            'semifinal'   => 900,
-            '1/2 final'   => 900,  // jaga-jaga variasi penulisan
-            '1/4 final'   => 800,
-            '1/8 final'   => 700,
-            '1/16 final'  => 600,
-            '1/32 final'  => 500,
-            'penyisihan'  => 100,
-        ];
 
         $details = \App\Models\MatchScheduleDetail::with([
             'schedule.arena',
@@ -367,87 +355,55 @@ class SyncController extends Controller
             'seniMatch.matchCategory',
         ])
         ->whereHas('schedule', fn($q) => $q->where('tournament_id', $tournament->id))
-        ->whereHas('seniMatch') // hanya seni
+        ->whereHas('seniMatch')
         ->get();
 
-        $result = $details->map(function ($detail) use ($priorityMap) {
+        $result = $details->map(function ($detail) {
             $match = $detail->seniMatch;
             if (!$match) return null;
 
-            // round_label: ambil dari JADWAL (sesuai requirement)
-            $roundLabel = $detail->round_label ?: $match->round_label; // fallback ke match kalau perlu
-            $roundLabelNorm = $roundLabel ? strtolower(trim($roundLabel)) : null;
-
-            // round_priority: pakai dari DB kalau ada; kalau tidak, fallback dari map di atas
-            $roundPriority = $match->round_priority ?? ($roundLabelNorm ? ($priorityMap[$roundLabelNorm] ?? null) : null);
-
             return [
-                // ====== IDs & mapping remote ======
-                'remote_match_id'       => $match->id,
-                'remote_schedule_id'    => $detail->match_schedule_id,
-                'remote_schedule_det_id'=> $detail->id,
-                'remote_contingent_id'  => $match->contingent_id,
-                'remote_team_member_1'  => $match->team_member_1,
-                'remote_team_member_2'  => $match->team_member_2,
-                'remote_team_member_3'  => $match->team_member_3,
+                'remote_match_id'     => $match->id,
+                'remote_contingent_id'=> $match->contingent_id,
+                'remote_team_member_1'=> $match->team_member_1,
+                'remote_team_member_2'=> $match->team_member_2,
+                'remote_team_member_3'=> $match->team_member_3,
 
-                // ====== Context jadwal ======
-                'tournament_name'       => $match->pool->tournament->name ?? '-',
-                'arena_name'            => $detail->schedule->arena->name ?? '-',
-                'match_date'            => $detail->schedule->scheduled_date,
-                'match_time'            => $detail->schedule->start_time,
+                'tournament_name'     => $match->pool->tournament->name ?? '-',
+                'arena_name'          => $detail->schedule->arena->name ?? '-',
+                'match_date'          => $detail->schedule->scheduled_date,
+                'match_time'          => $detail->schedule->start_time,
+                'pool_name'           => $match->pool->name ?? '-',
 
-                // ====== Pool & kategori ======
-                'pool_id'               => $match->pool_id,
-                'pool_name'             => $match->pool->name ?? '-',
-                'age_category_id'       => $match->pool->ageCategory->id ?? null,
-                'age_category'          => $match->pool->ageCategory->name ?? '-',
-                'match_category_id'     => $match->match_category_id,
-                'category'              => match ($match->match_category_id) {
+                'match_number'        => $detail->order,
+                'match_order'         => $detail->order,
+
+                'category' => match ($match->match_category_id) {
                     2 => 'Tunggal',
                     3 => 'Ganda',
                     4 => 'Regu',
                     5 => 'Solo Kreatif',
                     default => 'Unknown',
                 },
-                'match_type'            => match ($match->match_category_id) {
+                'match_type' => match ($match->match_category_id) {
                     2 => 'seni_tunggal',
                     3 => 'seni_ganda',
                     4 => 'seni_regu',
                     5 => 'solo_kreatif',
                     default => 'unknown',
                 },
-                'gender'                => $match->gender,
-
-                // ====== Peserta (display) ======
-                'contingent_name'       => $match->contingent?->name ?? 'TBD',
-                'participant_1'         => $match->teamMember1?->name ?? null,
-                'participant_2'         => $match->teamMember2?->name ?? null,
-                'participant_3'         => $match->teamMember3?->name ?? null,
-
-                // ====== Ordering / nomor partai ======
-                'match_number'          => $detail->order,
-                'match_order'           => $detail->order,
-
-                // ====== BATTLE FIELDS untuk sinkron lokal ======
-                'mode'                  => $match->mode ?? 'default',
-                'battle_group'          => $match->battle_group,      // group pasangan (red/blue) per round
-                'round'                 => $match->round,
-                'round_label'           => $roundLabel,               // DARI JADWAL
-                'round_priority'        => $roundPriority,            // dari DB / fallback map
-                'corner'                => $match->corner,            // 'red' | 'blue' | null (non-battle)
-                'winner_corner'         => $match->winner_corner,     // 'red' | 'blue' | null
-                'parent_match_red_id'   => $match->parent_match_red_id,
-                'parent_match_blue_id'  => $match->parent_match_blue_id,
-
-                // ====== Nilai akhir kalau ada ======
-                'final_score'           => null,
+                'gender'           => $match->gender,
+                'contingent_name'  => $match->contingent?->name ?? 'TBD',
+                'participant_1'    => $match->teamMember1?->name ?? null,
+                'participant_2'    => $match->teamMember2?->name ?? null,
+                'participant_3'    => $match->teamMember3?->name ?? null,
+                'age_category'     => $match->pool->ageCategory->name ?? '-',
+                'final_score'      => null,
             ];
-        })->filter()->values();
+        })->filter(); // buang null jika ada
 
-        return response()->json($result);
+        return response()->json($result->values());
     }
-
 
 
 
