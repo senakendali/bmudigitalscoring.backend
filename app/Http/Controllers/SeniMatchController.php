@@ -2748,7 +2748,7 @@ class SeniMatchController extends Controller
         DB::commit();
 
         return response()->json([
-            'message' => 'Regenerate pool (battle) berhasil. Tidak membuat dummy pada tahap ini.',
+            'message' => 'Regenerate pool (battle) berhasil.',
             'pool_id' => $pool->id,
             'mode'    => 'battle',
         ]);
