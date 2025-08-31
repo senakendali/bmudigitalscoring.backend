@@ -13,8 +13,6 @@ use Barryvdh\DomPDF\Facade\Pdf;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Schema;
-use Faker\Factory as Faker;
 
 
 class SeniMatchController extends Controller
@@ -1251,7 +1249,7 @@ class SeniMatchController extends Controller
             \App\Models\SeniPool::whereIn('id', $oldPools)->delete();
         }
 
-        // Ambil peserta (TP + relasi team_member sebagai 'participant')
+        // Ambil peserta
         $participants = \App\Models\TournamentParticipant::where('tournament_id', $validated['tournament_id'])
             ->whereHas('participant', function ($q) use ($validated) {
                 $q->where('match_category_id', $validated['match_category_id'])
@@ -1264,79 +1262,28 @@ class SeniMatchController extends Controller
             ->values();
 
         if ($participants->isEmpty()) {
-            // tetap lanjut: kita akan bikin full dummy kalau mode-nya full_prestasi
-            if (($validated['bracket_type'] ?? null) !== 'full_prestasi') {
-                return response()->json(['message' => 'No participants found.'], 404);
-            }
+            return response()->json(['message' => 'No participants found.'], 404);
         }
 
         // Tipe pertandingan + ukuran tim
         [$matchType, $teamSize] = $this->resolveMatchTypeAndSize((int)$validated['match_category_id']);
 
-        // === SPECIAL: Full Prestasi → wajib minimal 6 tim (SENI)
+        // Bentuk tim
+        $teams = $this->groupIntoTeams($participants, $teamSize);
+        if ($teams->isEmpty()) {
+            return response()->json(['message' => 'No valid teams could be formed.'], 422);
+        }
+
+        // Pooling
         if (($validated['bracket_type'] ?? null) === 'full_prestasi') {
-            // Bentuk tim dari peserta awal
-            $teams = $this->groupIntoTeams($participants, $teamSize);
-            $currentTeamCount = $teams->count();
-
-            if ($currentTeamCount < 6) {
-                $neededTeams = 6 - $currentTeamCount;
-
-                // Pastikan kontingen dummy 310–315 ada (hindari FK error)
-                $this->ensureContingentsExist([310,311,312,313,314,315], $validated['tournament_id']);
-
-                // Cari template (kalau ada peserta asli)
-                $templateMember = optional($participants->first())->participant;
-                if (!$templateMember) {
-                    // fallback template dari turnamen ini (kriteria sama)
-                    $templateMember = TeamMember::query()
-                        ->where('match_category_id', $validated['match_category_id'])
-                        ->where('age_category_id',  $validated['age_category_id'])
-                        ->where('gender',           $validated['gender'])
-                        ->first();
-                }
-
-                // Buat dummy TEAMS sesuai teamSize
-                for ($i = 0; $i < $neededTeams; $i++) {
-                    $contingentId = [310,311,312,313,314,315][$i % 6];
-                    $this->createDummySeniTeam(
-                        $teamSize,
-                        $contingentId,
-                        $templateMember,
-                        $validated
-                    );
-                }
-
-                // Re-load participants (sudah termasuk dummy)
-                $participants = \App\Models\TournamentParticipant::where('tournament_id', $validated['tournament_id'])
-                    ->whereHas('participant', function ($q) use ($validated) {
-                        $q->where('match_category_id', $validated['match_category_id'])
-                        ->where('age_category_id',  $validated['age_category_id'])
-                        ->where('gender',           $validated['gender']);
-                    })
-                    ->with('participant')
-                    ->get()
-                    ->filter(fn($tp) => $tp->participant !== null)
-                    ->values();
-            }
-
-            // Rebuild teams final
-            $teams = $this->groupIntoTeams($participants, $teamSize);
-
-            // Satu pool besar → K = nextPow2(N)
+            // Satu pool besar → K = nextPow2(N) per pool (di bawah)
             $pools = collect([$teams->shuffle()->values()]);
         } else {
-            // Non full_prestasi: flow lama
-            $teams = $this->groupIntoTeams($participants, $teamSize);
-            if ($teams->isEmpty()) {
-                return response()->json(['message' => 'No valid teams could be formed.'], 422);
-            }
-
+            // Beberapa pool dengan ukuran <= requested (2/4/8/16); nilai lain akan dinormalisasi K per pool
             $requested = max(2, (int)($validated['bracket_type'] ?? 2));
             $pools = $teams->shuffle()->chunk($requested);
         }
 
-        // ==== lanjut: sama seperti kode lu (pembuatan pool & match) ====
         foreach ($pools as $i => $chunk) {
             $pool = \App\Models\SeniPool::create([
                 'tournament_id'      => $validated['tournament_id'],
@@ -1351,13 +1298,13 @@ class SeniMatchController extends Controller
             $N = $chunk->count();
             if ($N === 0) continue;
 
-            // ===== Hanya 1 tim → Final Only (1 row sisi BLUE) =====
+            // ===== SPECIAL CASE: Hanya 1 tim → "Final Only" (1 row sisi BLUE) =====
             if ($N === 1) {
                 $onlyTeam = $chunk->values()->first();
                 [$m1, $m2, $m3] = $this->extractMemberIds($onlyTeam, $teamSize);
 
                 $round       = 1;
-                $totalRounds = 1;
+                $totalRounds = 1; // getRoundLabel => "Final"
                 $roundLabel  = $this->getRoundLabel($round, $totalRounds);
 
                 \App\Models\SeniMatch::create([
@@ -1369,8 +1316,8 @@ class SeniMatchController extends Controller
                     'match_type'        => $matchType,
                     'mode'              => 'battle',
                     'round'             => $round,
-                    'round_label'       => $roundLabel,
-                    'corner'            => 'blue',
+                    'round_label'       => $roundLabel,  // "Final"
+                    'corner'            => 'blue',       // satu row saja
                     'contingent_id'     => $onlyTeam['contingent_id'] ?? null,
                     'team_member_1'     => $m1,
                     'team_member_2'     => $teamSize >= 2 ? $m2 : null,
@@ -1378,29 +1325,30 @@ class SeniMatchController extends Controller
                     'status'            => 'not_started',
                     'winner_corner'     => 'blue',
                 ]);
+
                 continue;
             }
 
-            // ===== NORMALISASI K =====
+            // ===== NORMALISASI K: berdasarkan N pool ini (selalu power-of-two ≥ N) =====
             $K = max(2, $this->nextPow2($N));
 
             // ===== Ronde 1: susun pasangan & BYE =====
-            $pairings    = [];
-            $bag         = $chunk->values();
+            $pairings    = [];               // pasangan [blueTeam|null, redTeam|null]
+            $bag         = $chunk->values(); // tim acak
             $battleGroup = 1;
 
-            $byeCount    = $K - $N;
-            $targetPairs = intdiv($K, 2);
+            $byeCount    = $K - $N;           // banyak BYE (tiap BYE = 1 pairing satu sisi null)
+            $targetPairs = intdiv($K, 2);     // jumlah pairing ronde 1 (mis. K=8 → 4 pairing)
             $byeBlueSide = true;
 
-            // (1) Sisipkan BYE dulu
+            // (1) Sisipkan BYE dulu (mis. N=6,K=8 → 2 BYE)
             for ($b = 0; $b < $byeCount && $bag->count() > 0; $b++) {
                 $team = $bag->shift();
                 $pairings[] = $byeBlueSide ? [$team, null] : [null, $team];
                 $byeBlueSide = !$byeBlueSide;
             }
 
-            // (2) Sisa tim dipasangkan normal
+            // (2) Sisa tim dipasangkan normal sampai jumlah pairing = targetPairs
             while (count($pairings) < $targetPairs && $bag->count() > 0) {
                 $blue = $bag->shift();
                 $red  = $bag->shift();
@@ -1413,20 +1361,21 @@ class SeniMatchController extends Controller
                 }
             }
 
-            // (3) Tambal kalau masih kurang
+            // (3) Tambal kalau masih kurang (kasus ekstrem)
             while (count($pairings) < $targetPairs) {
                 $pairings[] = [null, null];
             }
 
-            $totalRounds = (int) log($K, 2);
+            $totalRounds = (int) log($K, 2); // K=8 → 3 ronde (R1, SF, Final)
 
-            // ===== Tulis Ronde 1 =====
+            // ===== Tulis Ronde 1 (BYE = 1 row saja + winner_corner) =====
             $round       = 1;
             $roundLabel  = $this->getRoundLabel($round, $totalRounds);
-            $currentRound = []; // setiap entry: [redMatchId|null, blueMatchId|null]
+            // setiap entry simpan [redMatchId|null, blueMatchId|null]
+            $currentRound = [];
 
             foreach ($pairings as [$blueTeam, $redTeam]) {
-                // spacer
+                // dua sisi null → spacer saja
                 if ($blueTeam === null && $redTeam === null) {
                     $currentRound[] = [null, null];
                     $battleGroup++;
@@ -1529,23 +1478,26 @@ class SeniMatchController extends Controller
                 $battleGroup++;
             }
 
-            // ===== Ronde berikutnya =====
+            // ===== Ronde berikutnya: carry-forward jika 1 parent; buat node kalau 2 parent =====
             while (count($currentRound) > 1) {
                 $round++;
                 $roundLabel = $this->getRoundLabel($round, $totalRounds);
                 $nextRound  = [];
 
                 for ($j = 0; $j < count($currentRound); $j += 2) {
+                    // format setiap entry: [redMatchId|null, blueMatchId|null]
                     $left  = $currentRound[$j]   ?? [null, null];
                     $right = $currentRound[$j+1] ?? [null, null];
 
-                    $blueParent = $left[1]  ?? null;
-                    $redParent  = $right[0] ?? null;
+                    $blueParent = $left[1]  ?? null; // winner BLUE dari pasangan kiri
+                    $redParent  = $right[0] ?? null; // winner RED  dari pasangan kanan
 
+                    // keduanya tidak ada → lewati
                     if ($blueParent === null && $redParent === null) {
                         continue;
                     }
 
+                    // Hanya 1 parent → carry-forward (tanpa buat node)
                     if ($blueParent !== null && $redParent === null) {
                         $nextRound[] = [null, $blueParent];
                         continue;
@@ -1555,6 +1507,7 @@ class SeniMatchController extends Controller
                         continue;
                     }
 
+                    // Dua parent ada → buat node normal
                     $blueNode = \App\Models\SeniMatch::create([
                         'pool_id'              => $pool->id,
                         'match_order'          => $battleGroup,
@@ -1585,9 +1538,10 @@ class SeniMatchController extends Controller
                         'status'               => 'not_started',
                     ]);
 
-                    // Prefill jika parent BYE
+                    // Prefill kalau parent BYE (di ronde sebelumnya tidak punya sibling)
                     $prevRound = $round - 1;
 
+                    // Prefill sisi BLUE
                     $pBlue = \App\Models\SeniMatch::find($blueParent);
                     if ($pBlue) {
                         $siblingBlueExists = \App\Models\SeniMatch::where('pool_id', $pool->id)
@@ -1604,6 +1558,7 @@ class SeniMatchController extends Controller
                         }
                     }
 
+                    // Prefill sisi RED
                     $pRed = \App\Models\SeniMatch::find($redParent);
                     if ($pRed) {
                         $siblingRedExists = \App\Models\SeniMatch::where('pool_id', $pool->id)
@@ -1630,164 +1585,6 @@ class SeniMatchController extends Controller
 
         return response()->json(['message' => 'Battle matches generated (power-of-two K with BYEs).']);
     }
-
-    // Buat satu TIM dummy (isi teamSize anggota). Tidak assign ke pool apa pun (Seni pakai SeniPool).
-    private function createDummySeniTeam(int $teamSize, int $contingentId, ?TeamMember $templateMember, array $validated): void
-    {
-        for ($i = 0; $i < $teamSize; $i++) {
-            $payload = $this->buildDummyTeamMemberPayload(
-                $templateMember,
-                $contingentId,
-                $validated['gender'] ?? null,
-                [
-                    'match_category_id' => $validated['match_category_id'],
-                    'age_category_id'   => $validated['age_category_id'],
-                    // kalau punya kolom championship_category_id khusus seni, bisa ikutkan dari template
-                    // 'championship_category_id' => $templateMember->championship_category_id ?? null,
-                ]
-            );
-
-            $tmId = DB::table('team_members')->insertGetId($payload);
-
-            TournamentParticipant::create([
-                'tournament_id'  => $validated['tournament_id'],
-                'team_member_id' => $tmId,
-                // tidak ada pool_id untuk seni di tahap ini
-            ]);
-        }
-    }
-
-    // Payload dummy TeamMember (Faker id_ID) + perisai kolom NOT NULL
-    private function buildDummyTeamMemberPayload(?TeamMember $original, int $contingentId, ?string $gender = null, array $overrides = []): array
-    {
-        $faker = Faker::create('id_ID');
-
-        $g = $gender ?: ($original->gender ?? 'male');
-        $first = $g === 'female' ? $faker->firstNameFemale : $faker->firstNameMale;
-        $last  = $faker->lastName;
-
-        $payload = [
-            'contingent_id'            => $contingentId,
-            'name'                     => $first.' '.$last,
-            'birth_place'              => $faker->city,
-            'birth_date'               => $faker->date(),
-            'gender'                   => $g,
-            'body_weight'              => 70,
-            'body_height'              => 170,
-            'blood_type'               => 'O',
-            'nik'                      => $faker->numerify('###############'),
-            'family_card_number'       => $faker->numerify('###############'),
-            'country_id'               => 103,
-            'province_id'              => 32,
-            'district_id'              => 3217,
-            'subdistrict_id'           => 321714,
-            'ward_id'                  => 3217142009,
-            'address'                  => $faker->address,
-            'championship_category_id' => $original->championship_category_id ?? null,
-            'match_category_id'        => $overrides['match_category_id'] ?? ($original->match_category_id ?? null),
-            'age_category_id'          => $overrides['age_category_id']    ?? ($original->age_category_id ?? null),
-            'category_class_id'        => $original->category_class_id ?? null, // biasanya tidak dipakai di seni
-            'registration_status'      => 'approved',
-            'is_dummy'                 => true,
-            'created_at'               => now(),
-            'updated_at'               => now(),
-        ];
-
-        $payload = array_merge($payload, $overrides);
-
-        return $this->withTeamMemberDefaults($payload);
-    }
-
-    // Pastikan kontingen (310–315) ada → hindari FK error
-    private function ensureContingentsExist(array $ids, ?int $tournamentId = null): void
-    {
-        $now = now();
-
-        foreach ($ids as $cid) {
-            $exists = DB::table('contingents')->where('id', $cid)->exists();
-            if ($exists) continue;
-
-            $data = [
-                'id'         => $cid,
-                'name'       => 'Dummy Contingent '.$cid,
-                'created_at' => $now,
-                'updated_at' => $now,
-            ];
-            if (Schema::hasColumn('contingents', 'slug')) {
-                $data['slug'] = 'dummy-contingent-'.$cid;
-            }
-            if ($tournamentId && Schema::hasColumn('contingents', 'tournament_id')) {
-                $data['tournament_id'] = $tournamentId;
-            }
-
-            $data = $this->withTableDefaults('contingents', $data, []);
-            DB::table('contingents')->insertOrIgnore($data);
-        }
-    }
-
-    // Perisai generic untuk tabel apa pun (skip kolom tertentu)
-    private function withTableDefaults(string $table, array $data, array $exclude = []): array
-    {
-        $exclude = array_values(array_unique(array_merge($exclude, ['id', 'created_at', 'updated_at'])));
-        try {
-            $cols = DB::table('information_schema.COLUMNS')
-                ->select('COLUMN_NAME','DATA_TYPE','IS_NULLABLE','COLUMN_DEFAULT','COLUMN_TYPE')
-                ->where('TABLE_SCHEMA', DB::getDatabaseName())
-                ->where('TABLE_NAME', $table)
-                ->get();
-
-            foreach ($cols as $col) {
-                $name = $col->COLUMN_NAME;
-                if (in_array($name, $exclude, true)) continue;
-                if (array_key_exists($name, $data)) continue;
-
-                if ($col->IS_NULLABLE === 'NO' && is_null($col->COLUMN_DEFAULT)) {
-                    $data[$name] = $this->defaultValueForType($col->DATA_TYPE, $col->COLUMN_TYPE);
-                }
-            }
-        } catch (\Throwable $e) { /* ignore */ }
-
-        return $data;
-    }
-
-    // Perisai khusus team_members
-    private function withTeamMemberDefaults(array $data): array
-    {
-        if (Schema::hasColumn('team_members', 'birth_place') && !array_key_exists('birth_place', $data)) {
-            $data['birth_place'] = 'Jakarta';
-        }
-        if (Schema::hasColumn('team_members', 'birth_date') && !array_key_exists('birth_date', $data)) {
-            $data['birth_date'] = '2000-01-01';
-        }
-        if (Schema::hasColumn('team_members', 'is_dummy') && !array_key_exists('is_dummy', $data)) {
-            $data['is_dummy'] = 1;
-        }
-
-        return $this->withTableDefaults('team_members', $data, []);
-    }
-
-    private function defaultValueForType(string $type, ?string $columnType = null)
-    {
-        switch (strtolower($type)) {
-            case 'int': case 'bigint': case 'smallint': case 'mediumint': case 'tinyint':
-            case 'decimal': case 'float': case 'double':
-                return 0;
-            case 'date':
-                return '2000-01-01';
-            case 'datetime': case 'timestamp':
-                return now();
-            case 'enum':
-                if ($columnType && preg_match("/enum\\((.*)\\)/i", $columnType, $m)) {
-                    $opts = array_map(fn($s) => trim($s, " '"), explode(',', $m[1]));
-                    return $opts[0] ?? '';
-                }
-                return '';
-            default:
-                return '';
-        }
-    }
-
-
 
     /** Power of two terdekat. Kalau jarak sama, pilih yang lebih kecil. */
     protected function nearestPow2PreferLower(int $n): int
@@ -1844,8 +1641,6 @@ class SeniMatchController extends Controller
         // 4) Baca konfigurasi pool & ASSIGNMENT LAMA (SEBELUM hapus match)
         $poolConfigs         = [];
         $existingAssignments = []; // pool_id => array<teamKey>
-        $hasFullPrestasiBattle = false;
-
         foreach ($pools as $pool) {
             $existingAssignments[$pool->id] = [];
 
@@ -1866,10 +1661,6 @@ class SeniMatchController extends Controller
             }
             if ($mode === null) $mode = 'default';
             if ($mode === 'battle' && $brkt === null) $brkt = 'full_prestasi';
-
-            if ($mode === 'battle' && $brkt === 'full_prestasi') {
-                $hasFullPrestasiBattle = true;
-            }
 
             // Kumpulkan assignment lama (pakai match round=1 untuk battle, semua baris untuk default)
             $rowsForKey = $mode === 'battle' ? $old->where('round', 1) : $old;
@@ -1906,17 +1697,19 @@ class SeniMatchController extends Controller
             ->filter(fn($tp) => $tp->participant !== null)
             ->values();
 
-        if ($participants->isEmpty() && !$hasFullPrestasiBattle) {
+        if ($participants->isEmpty()) {
             return response()->json(['message' => 'Tidak ada peserta ditemukan.'], 404);
         }
 
-        // 7) Bentuk tim awal (boleh kosong kalau nanti full_prestasi kita isi dummy)
+        // 7) Bentuk tim
         $teams = $this->groupIntoTeams($participants, $teamSize);
-        if ($teams->isEmpty() && !$hasFullPrestasiBattle) {
+        if ($teams->isEmpty()) {
             return response()->json(['message' => 'Tidak ada tim valid yang bisa dibentuk.'], 422);
         }
 
         // 8) Rekonstruksi bucket pool: JANGAN PINDAH POOL
+        //    - Tim lama: tetap di pool asal (berdasar teamKey dari match lama)
+        //    - Tim baru: taruh ke pool dengan jumlah tim saat ini paling sedikit
         $lookup = []; // teamKey => team
         foreach ($teams as $t) {
             $memberIds = $t['members']->pluck('id')->take($teamSize)->filter()->values()->all();
@@ -1952,54 +1745,6 @@ class SeniMatchController extends Controller
                 if ($cnt < $minCnt) { $minCnt = $cnt; $minIdx = $i; }
             }
             $buckets[$minIdx][] = $t;
-        }
-
-        // 8B) ⬅️ Tambahan: FULL PRESTASI (BATTLE) → MINIMAL 6 TIM PER POOL
-        //     Jika kurang dari 6, buat dummy tim (kontingen 310–315) & taruh di bucket pool tsb.
-        if ($hasFullPrestasiBattle) {
-            // pastikan kontingen dummy ada (hindari FK)
-            $this->ensureContingentsExist([310,311,312,313,314,315], $tournamentId);
-
-            // Cari template member (kalau ada real participant)
-            $templateMember = optional($participants->first())->participant;
-            if (!$templateMember) {
-                $templateMember = \App\Models\TeamMember::query()
-                    ->where('match_category_id', $matchCategoryId)
-                    ->where('age_category_id',  $ageCategoryId)
-                    ->where('gender',           $gender)
-                    ->first();
-            }
-
-            foreach ($pools as $i => $pool) {
-                $cfg = $poolConfigs[$pool->id] ?? ['mode' => 'default', 'bracket_type' => null];
-                if (($cfg['mode'] ?? null) !== 'battle' || ($cfg['bracket_type'] ?? null) !== 'full_prestasi') {
-                    continue;
-                }
-
-                $currentCount = count($buckets[$i] ?? []);
-                if ($currentCount >= 6) continue;
-
-                $need = 6 - $currentCount;
-                for ($d = 0; $d < $need; $d++) {
-                    $contingentId = [310,311,312,313,314,315][$d % 6];
-
-                    // bikin 1 tim dummy (teamSize anggota), DAFTARKAN ke tournament_participants
-                    $team = $this->createDummySeniTeamAndReturnTeam(
-                        $teamSize,
-                        $contingentId,
-                        $templateMember,
-                        [
-                            'tournament_id'     => $tournamentId,
-                            'match_category_id' => $matchCategoryId,
-                            'age_category_id'   => $ageCategoryId,
-                            'gender'            => $gender,
-                        ]
-                    );
-
-                    // masukkan langsung ke bucket pool ini
-                    $buckets[$i][] = $team;
-                }
-            }
         }
 
         // 9) Bangun ulang per pool (acak POSISI di dalam pool saja)
@@ -2074,9 +1819,9 @@ class SeniMatchController extends Controller
                 continue;
             }
 
-            // === K di-normalisasi dari N (power of two, ≥ N)
+            // === K di-normalisasi dari N (power of two, ≥ N) — konsisten dgn generate
             $K = max(2, $this->nextPow2($N));
-            $totalRounds = (int) log($K, 2);
+            $totalRounds = (int) log($K, 2); // contoh K=8 → 3 ronde
 
             // Ronde 1: sisipkan BYE dulu, lalu pairing normal
             $pairings    = []; // [blueTeam|null, redTeam|null]
@@ -2232,10 +1977,12 @@ class SeniMatchController extends Controller
                     $blueParent = $left[1]  ?? null; // winner BLUE kiri
                     $redParent  = $right[0] ?? null; // winner RED  kanan
 
+                    // dua-duanya kosong → lewati
                     if ($blueParent === null && $redParent === null) {
                         continue;
                     }
 
+                    // ⚠️ hanya 1 parent → carry-forward (tanpa buat node)
                     if ($blueParent !== null && $redParent === null) {
                         $nextRound[] = [null, $blueParent];
                         continue;
@@ -2245,6 +1992,7 @@ class SeniMatchController extends Controller
                         continue;
                     }
 
+                    // ✅ dua parent ada → buat node normal, prefill jika parent BYE
                     $blueNode = \App\Models\SeniMatch::create([
                         'pool_id'              => $pool->id,
                         'match_order'          => $battleGroup,
@@ -2275,9 +2023,10 @@ class SeniMatchController extends Controller
                         'status'               => 'not_started',
                     ]);
 
-                    // Prefill bila parent BYE (tak ada sibling di ronde sebelumnya)
+                    // Prefill bila parent adalah BYE (tak ada sibling di ronde sebelumnya)
                     $prevRound = $round - 1;
 
+                    // Prefill sisi BLUE
                     $pBlue = \App\Models\SeniMatch::find($blueParent);
                     if ($pBlue) {
                         $siblingBlueExists = \App\Models\SeniMatch::where('pool_id', $pool->id)
@@ -2294,6 +2043,7 @@ class SeniMatchController extends Controller
                         }
                     }
 
+                    // Prefill sisi RED
                     $pRed = \App\Models\SeniMatch::find($redParent);
                     if ($pRed) {
                         $siblingRedExists = \App\Models\SeniMatch::where('pool_id', $pool->id)
@@ -2319,243 +2069,276 @@ class SeniMatchController extends Controller
         }
 
         return response()->json([
-            'message' => 'Regenerate berhasil',
+            'message' => 'Regenerate OK. Tim tetap di pool asal, posisi diacak dalam pool, BYE/Final-only & carry-forward konsisten.',
         ]);
     }
-
 
 
     public function regeneratePool(Request $request, \App\Models\SeniPool $pool = null)
-{
-    // Bisa via path param {pool} atau body pool_id
-    if (!$pool) {
-        $data = $request->validate([
-            'pool_id' => 'required|exists:seni_pools,id',
-        ]);
-        $pool = \App\Models\SeniPool::findOrFail($data['pool_id']);
-    }
-
-    // Scope dari pool
-    $tournamentId    = (int) $pool->tournament_id;
-    $matchCategoryId = (int) $pool->match_category_id;
-    $ageCategoryId   = (int) $pool->age_category_id;
-    $gender          = (string) $pool->gender;
-
-    // Helper yang sudah ada di controller
-    [$matchType, $teamSize] = $this->resolveMatchTypeAndSize($matchCategoryId);
-
-    DB::beginTransaction();
-    try {
-        // Ambil semua match lama di pool ini
-        $oldMatches = \App\Models\SeniMatch::where('pool_id', $pool->id)->get();
-
-        if ($oldMatches->isEmpty()) {
-            DB::rollBack();
-            return response()->json([
-                'message' => 'Pool belum memiliki match — tidak ada yang perlu diregenerasi.',
-            ], 404);
+    {
+        // Mendukung dua cara: path param {pool} ATAU body pool_id
+        if (!$pool) {
+            $data = $request->validate([
+                'pool_id' => 'required|exists:seni_pools,id',
+            ]);
+            $pool = \App\Models\SeniPool::findOrFail($data['pool_id']);
         }
 
-        // Mode & bracket_type (pakai setting pool, fallback dari match lama)
-        $mode        = $pool->mode;
-        $bracketType = $pool->bracket_type;
+        // Ambil scope dari pool (supaya tidak perlu input lain)
+        $tournamentId    = (int) $pool->tournament_id;
+        $matchCategoryId = (int) $pool->match_category_id;
+        $ageCategoryId   = (int) $pool->age_category_id;
+        $gender          = (string) $pool->gender;
 
-        if ($mode === null) {
-            $mode = $oldMatches->contains(fn($m) => $m->mode === 'battle') ? 'battle' : 'default';
-        }
-        if ($mode === 'battle' && $bracketType === null) {
-            $maxRound = (int) $oldMatches->max('round');
-            if ($maxRound > 0) {
-                $pow = 1 << $maxRound; // 2^maxRound
-                $bracketType = in_array($pow, [2,4,8,16,32,64], true) ? (string)$pow : 'full_prestasi';
-            } else {
-                $bracketType = 'full_prestasi';
-            }
-        }
-        if ($mode === null) $mode = 'default';
+        // Helper yang sudah ada di controller-mu
+        [$matchType, $teamSize] = $this->resolveMatchTypeAndSize($matchCategoryId);
 
-        // --- Kumpulkan tim yang memang ada di pool ini ---
-        $makeTeamKey = function (?int $contingentId, array $memberIds): string {
-            $ids = array_values(array_filter(array_map('intval', $memberIds), fn($v) => $v > 0));
-            sort($ids, SORT_NUMERIC);
-            return (string)($contingentId ?? 0) . ':' . implode('-', $ids);
-        };
+        DB::beginTransaction();
+        try {
+            // Ambil semua match lama di pool ini
+            $oldMatches = \App\Models\SeniMatch::where('pool_id', $pool->id)->get();
 
-        $teams = []; // array<teamKey => ['contingent_id','m1','m2','m3']>
-        $addTeam = function (\App\Models\SeniMatch $m) use (&$teams, $teamSize, $makeTeamKey) {
-            // skip baris kosong total
-            if (empty($m->contingent_id) && empty($m->team_member_1) && empty($m->team_member_2) && empty($m->team_member_3)) {
-                return;
-            }
-            $members = [];
-            if (!empty($m->team_member_1)) $members[] = (int) $m->team_member_1;
-            if ($teamSize >= 2 && !empty($m->team_member_2)) $members[] = (int) $m->team_member_2;
-            if ($teamSize >= 3 && !empty($m->team_member_3)) $members[] = (int) $m->team_member_3;
-
-            $key = $makeTeamKey($m->contingent_id, $members);
-            if (!isset($teams[$key])) {
-                $teams[$key] = [
-                    'contingent_id' => $m->contingent_id,
-                    'm1'            => $m->team_member_1,
-                    'm2'            => $teamSize >= 2 ? $m->team_member_2 : null,
-                    'm3'            => $teamSize >= 3 ? $m->team_member_3 : null,
-                ];
-            }
-        };
-
-        if ($mode === 'battle') {
-            // Battle: ambil tim dari ROUND 1 saja (tiap sisi)
-            $r1 = $oldMatches->where('round', 1);
-            foreach ($r1 as $m) $addTeam($m);
-        } else {
-            // Non-battle: tiap baris = satu tim
-            foreach ($oldMatches as $m) $addTeam($m);
-        }
-
-        // Guard: untuk battle + full_prestasi, minimal 6 tim (tidak bikin dummy di sini)
-        if ($mode === 'battle' && $bracketType === 'full_prestasi') {
-            $currentTeams = count($teams);
-            if ($currentTeams < 6) {
+            if ($oldMatches->isEmpty()) {
                 DB::rollBack();
                 return response()->json([
-                    'message' => "Pool full_prestasi ini berisi {$currentTeams} tim (< 6). "
-                               . "Dummy hanya dibuat saat generate/regenerate global. "
-                               . "Silakan jalankan generate/regenerate untuk kategori ini agar kuota minimal terpenuhi.",
+                    'message' => 'Pool belum memiliki match — tidak ada yang perlu diregenerasi.'
+                ], 404);
+            }
+
+            // Tentukan mode & bracket_type (prioritas pakai setting di pool, fallback dari match lama)
+            $mode        = $pool->mode;
+            $bracketType = $pool->bracket_type;
+
+            if ($mode === null) {
+                $mode = $oldMatches->contains(fn($m) => $m->mode === 'battle') ? 'battle' : 'default';
+            }
+            if ($mode === 'battle' && $bracketType === null) {
+                $maxRound = (int) $oldMatches->max('round');
+                if ($maxRound > 0) {
+                    $pow = 1 << $maxRound; // 2^maxRound
+                    $bracketType = in_array($pow, [2,4,8,16,32,64], true) ? (string) $pow : 'full_prestasi';
+                } else {
+                    $bracketType = 'full_prestasi';
+                }
+            }
+            if ($mode === null) $mode = 'default';
+
+            // --- Kumpulkan "tim" yang memang ada di pool ini ---
+            $makeTeamKey = function (?int $contingentId, array $memberIds): string {
+                $ids = array_values(array_filter(array_map('intval', $memberIds), fn($v) => $v > 0));
+                sort($ids, SORT_NUMERIC);
+                return (string)($contingentId ?? 0) . ':' . implode('-', $ids);
+            };
+
+            $teams = []; // array<teamKey => teamArr>
+            $addTeam = function (\App\Models\SeniMatch $m) use (&$teams, $teamSize, $makeTeamKey) {
+                // abaikan baris kosong murni
+                if (empty($m->contingent_id) && empty($m->team_member_1) && empty($m->team_member_2) && empty($m->team_member_3)) {
+                    return;
+                }
+                $members = [];
+                if (!empty($m->team_member_1)) $members[] = (int) $m->team_member_1;
+                if ($teamSize >= 2 && !empty($m->team_member_2)) $members[] = (int) $m->team_member_2;
+                if ($teamSize >= 3 && !empty($m->team_member_3)) $members[] = (int) $m->team_member_3;
+
+                $key = $makeTeamKey($m->contingent_id, $members);
+                if (!isset($teams[$key])) {
+                    $teams[$key] = [
+                        'contingent_id' => $m->contingent_id,
+                        'm1' => $m->team_member_1,
+                        'm2' => $teamSize >= 2 ? $m->team_member_2 : null,
+                        'm3' => $teamSize >= 3 ? $m->team_member_3 : null,
+                    ];
+                }
+            };
+
+            if ($mode === 'battle') {
+                // Ambil tim dari ROUND 1 saja (tiap sisi)
+                $r1 = $oldMatches->where('round', 1);
+                foreach ($r1 as $m) $addTeam($m);
+            } else {
+                // Non-battle: setiap baris adalah satu "tim"
+                foreach ($oldMatches as $m) $addTeam($m);
+            }
+
+            if (empty($teams)) {
+                DB::rollBack();
+                return response()->json([
+                    'message' => 'Tidak menemukan tim valid di pool ini untuk diregenerasi.'
                 ], 422);
             }
-        }
 
-        if (empty($teams)) {
-            DB::rollBack();
-            return response()->json([
-                'message' => 'Tidak menemukan tim valid di pool ini untuk diregenerasi.',
-            ], 422);
-        }
+            // --- Hapus schedule detail yg refer ke match pool ini, lalu hapus match-nya ---
+            $oldIds = $oldMatches->pluck('id')->all();
+            \App\Models\MatchScheduleDetail::whereIn('seni_match_id', $oldIds)->delete();
+            \App\Models\SeniMatch::whereIn('id', $oldIds)->delete();
 
-        // Hapus schedule detail & match lama untuk pool ini
-        $oldIds = $oldMatches->pluck('id')->all();
-        \App\Models\MatchScheduleDetail::whereIn('seni_match_id', $oldIds)->delete();
-        \App\Models\SeniMatch::whereIn('id', $oldIds)->delete();
+            // --- Bangun ulang ---
+            $bag = collect(array_values($teams))->shuffle()->values(); // acak posisi DALAM pool
 
-        // Bangun ulang dari tim yang ada (acak posisi di dalam pool)
-        $bag = collect(array_values($teams))->shuffle()->values();
+            if ($mode !== 'battle') {
+                // ======================= DEFAULT =======================
+                $order = 1;
+                foreach ($bag as $t) {
+                    \App\Models\SeniMatch::create([
+                        'pool_id'           => $pool->id,
+                        'match_order'       => $order++,
+                        'gender'            => $gender,
+                        'match_category_id' => $matchCategoryId,
+                        'match_type'        => $matchType,
+                        'mode'              => 'default',
+                        'contingent_id'     => $t['contingent_id'] ?? null,
+                        'team_member_1'     => $t['m1'] ?? null,
+                        'team_member_2'     => $teamSize >= 2 ? ($t['m2'] ?? null) : null,
+                        'team_member_3'     => $teamSize >= 3 ? ($t['m3'] ?? null) : null,
+                        'status'            => 'not_started',
+                    ]);
+                }
 
-        if ($mode !== 'battle') {
-            // ======================= DEFAULT =======================
-            $order = 1;
-            foreach ($bag as $t) {
-                \App\Models\SeniMatch::create([
-                    'pool_id'           => $pool->id,
-                    'match_order'       => $order++,
-                    'gender'            => $gender,
-                    'match_category_id' => $matchCategoryId,
-                    'match_type'        => $matchType,
-                    'mode'              => 'default',
-                    'contingent_id'     => $t['contingent_id'] ?? null,
-                    'team_member_1'     => $t['m1'] ?? null,
-                    'team_member_2'     => $teamSize >= 2 ? ($t['m2'] ?? null) : null,
-                    'team_member_3'     => $teamSize >= 3 ? ($t['m3'] ?? null) : null,
-                    'status'            => 'not_started',
+                DB::commit();
+                return response()->json([
+                    'message' => 'Regenerate pool (non-battle) berhasil.',
+                    'pool_id' => $pool->id,
+                    'mode'    => 'default',
+                    'count'   => $bag->count(),
                 ]);
             }
 
-            DB::commit();
-            return response()->json([
-                'message' => 'Regenerate pool (non-battle) berhasil.',
-                'pool_id' => $pool->id,
-                'mode'    => 'default',
-                'count'   => $bag->count(),
-            ]);
-        }
+            // ======================= BATTLE / BRACKET =======================
+            $N = $bag->count();
+            if ($N === 1) {
+                $only = $bag->first();
+                $round       = 1;
+                $totalRounds = 1;
+                $roundLabel  = $this->getRoundLabel($round, $totalRounds);
 
-        // ======================= BATTLE / BRACKET =======================
-        $N = $bag->count();
+                \App\Models\SeniMatch::create([
+                    'pool_id'           => $pool->id,
+                    'match_order'       => 1,
+                    'battle_group'      => 1,
+                    'gender'            => $gender,
+                    'match_category_id' => $matchCategoryId,
+                    'match_type'        => $matchType,
+                    'mode'              => 'battle',
+                    'round'             => $round,
+                    'round_label'       => $roundLabel,
+                    'corner'            => 'blue',
+                    'contingent_id'     => $only['contingent_id'] ?? null,
+                    'team_member_1'     => $only['m1'] ?? null,
+                    'team_member_2'     => $teamSize >= 2 ? ($only['m2'] ?? null) : null,
+                    'team_member_3'     => $teamSize >= 3 ? ($only['m3'] ?? null) : null,
+                    'status'            => 'not_started',
+                    'winner_corner'     => 'blue', // auto-menang
+                ]);
 
-        // N=1 → Final only
-        if ($N === 1) {
-            $only = $bag->first();
-            $round       = 1;
-            $totalRounds = 1;
-            $roundLabel  = $this->getRoundLabel($round, $totalRounds);
+                DB::commit();
+                return response()->json([
+                    'message' => 'Regenerate pool (battle, final-only) berhasil.',
+                    'pool_id' => $pool->id,
+                    'mode'    => 'battle',
+                    'count'   => 1,
+                ]);
+            }
 
-            \App\Models\SeniMatch::create([
-                'pool_id'           => $pool->id,
-                'match_order'       => 1,
-                'battle_group'      => 1,
-                'gender'            => $gender,
-                'match_category_id' => $matchCategoryId,
-                'match_type'        => $matchType,
-                'mode'              => 'battle',
-                'round'             => $round,
-                'round_label'       => $roundLabel,
-                'corner'            => 'blue',
-                'contingent_id'     => $only['contingent_id'] ?? null,
-                'team_member_1'     => $only['m1'] ?? null,
-                'team_member_2'     => $teamSize >= 2 ? ($only['m2'] ?? null) : null,
-                'team_member_3'     => $teamSize >= 3 ? ($only['m3'] ?? null) : null,
-                'status'            => 'not_started',
-                'winner_corner'     => 'blue',
-            ]);
+            // === K = nextPow2(N) (algoritma terbaru, power-of-two, ≥ N)
+            $K = max(2, $this->nextPow2($N));
+            $totalRounds = (int) log($K, 2); // contoh K=8 → 3 ronde
 
-            DB::commit();
-            return response()->json([
-                'message' => 'Regenerate pool (battle, final-only) berhasil.',
-                'pool_id' => $pool->id,
-                'mode'    => 'battle',
-                'count'   => 1,
-            ]);
-        }
+            // Ronde 1: sisipkan BYE dulu, lalu pairing normal
+            $pairings    = []; // [blueTeam|null, redTeam|null]
+            $battleGroup = 1;
 
-        // K = nextPow2(N) (power-of-two, ≥ N)
-        $K = max(2, $this->nextPow2($N));
-        $totalRounds = (int) log($K, 2);
+            $byeCount    = $K - $N;
+            $targetPairs = intdiv($K, 2);
+            $byeBlueSide = true;
 
-        // Ronde 1: sisipkan BYE dulu, lalu pairing normal
-        $pairings    = []; // [blueTeam|null, redTeam|null]
-        $battleGroup = 1;
-
-        $byeCount    = $K - $N;
-        $targetPairs = intdiv($K, 2);
-        $byeBlueSide = true;
-
-        // (1) BYE dulu
-        for ($b = 0; $b < $byeCount && $bag->count() > 0; $b++) {
-            $team = $bag->shift();
-            $pairings[] = $byeBlueSide ? [$team, null] : [null, $team];
-            $byeBlueSide = !$byeBlueSide;
-        }
-        // (2) Pairing sisa
-        while (count($pairings) < $targetPairs && $bag->count() > 0) {
-            $blue = $bag->shift();
-            $red  = $bag->shift();
-            if ($blue === null && $red === null) {
+            // (1) BYE dulu
+            for ($b = 0; $b < $byeCount && $bag->count() > 0; $b++) {
+                $team = $bag->shift();
+                $pairings[] = $byeBlueSide ? [$team, null] : [null, $team];
+                $byeBlueSide = !$byeBlueSide;
+            }
+            // (2) Pairing sisa
+            while (count($pairings) < $targetPairs && $bag->count() > 0) {
+                $blue = $bag->shift();
+                $red  = $bag->shift();
+                if ($blue === null && $red === null) {
+                    $pairings[] = [null, null];
+                } elseif ($red === null) {
+                    $pairings[] = [$blue, null];
+                } else {
+                    $pairings[] = [$blue, $red];
+                }
+            }
+            // (3) Tambal jika kurang
+            while (count($pairings) < $targetPairs) {
                 $pairings[] = [null, null];
-            } elseif ($red === null) {
-                $pairings[] = [$blue, null];
-            } else {
-                $pairings[] = [$blue, $red];
-            }
-        }
-        // (3) Tambal jika kurang
-        while (count($pairings) < $targetPairs) {
-            $pairings[] = [null, null];
-        }
-
-        // Tulis Ronde 1 (BYE = 1 row + winner_corner)
-        $round        = 1;
-        $roundLabel   = $this->getRoundLabel($round, $totalRounds);
-        // simpan tiap entry: [RED_id|null, BLUE_id|null]
-        $currentRound = [];
-
-        foreach ($pairings as [$blueTeam, $redTeam]) {
-            if ($blueTeam === null && $redTeam === null) {
-                $currentRound[] = [null, null];
-                $battleGroup++;
-                continue;
             }
 
-            // BYE sisi BLUE
-            if ($blueTeam !== null && $redTeam === null) {
+            // Tulis Ronde 1 (BYE = 1 row + winner_corner)
+            $round        = 1;
+            $roundLabel   = $this->getRoundLabel($round, $totalRounds);
+            // simpan tiap entry: [RED_id|null, BLUE_id|null]
+            $currentRound = [];
+
+            foreach ($pairings as [$blueTeam, $redTeam]) {
+                if ($blueTeam === null && $redTeam === null) {
+                    $currentRound[] = [null, null];
+                    $battleGroup++;
+                    continue;
+                }
+
+                // BYE sisi BLUE
+                if ($blueTeam !== null && $redTeam === null) {
+                    $blue = \App\Models\SeniMatch::create([
+                        'pool_id'           => $pool->id,
+                        'match_order'       => $battleGroup,
+                        'battle_group'      => $battleGroup,
+                        'gender'            => $gender,
+                        'match_category_id' => $matchCategoryId,
+                        'match_type'        => $matchType,
+                        'mode'              => 'battle',
+                        'round'             => $round,
+                        'round_label'       => $roundLabel,
+                        'corner'            => 'blue',
+                        'contingent_id'     => $blueTeam['contingent_id'] ?? null,
+                        'team_member_1'     => $blueTeam['m1'] ?? null,
+                        'team_member_2'     => $teamSize >= 2 ? ($blueTeam['m2'] ?? null) : null,
+                        'team_member_3'     => $teamSize >= 3 ? ($blueTeam['m3'] ?? null) : null,
+                        'status'            => 'not_started',
+                        'winner_corner'     => 'blue',
+                    ]);
+                    $currentRound[] = [null, $blue->id];
+                    $battleGroup++;
+                    continue;
+                }
+
+                // BYE sisi RED
+                if ($blueTeam === null && $redTeam !== null) {
+                    $red = \App\Models\SeniMatch::create([
+                        'pool_id'           => $pool->id,
+                        'match_order'       => $battleGroup,
+                        'battle_group'      => $battleGroup,
+                        'gender'            => $gender,
+                        'match_category_id' => $matchCategoryId,
+                        'match_type'        => $matchType,
+                        'mode'              => 'battle',
+                        'round'             => $round,
+                        'round_label'       => $roundLabel,
+                        'corner'            => 'red',
+                        'contingent_id'     => $redTeam['contingent_id'] ?? null,
+                        'team_member_1'     => $redTeam['m1'] ?? null,
+                        'team_member_2'     => $teamSize >= 2 ? ($redTeam['m2'] ?? null) : null,
+                        'team_member_3'     => $teamSize >= 3 ? ($redTeam['m3'] ?? null) : null,
+                        'status'            => 'not_started',
+                        'winner_corner'     => 'red',
+                    ]);
+                    $currentRound[] = [$red->id, null];
+                    $battleGroup++;
+                    continue;
+                }
+
+                // Normal
                 $blue = \App\Models\SeniMatch::create([
                     'pool_id'           => $pool->id,
                     'match_order'       => $battleGroup,
@@ -2572,16 +2355,8 @@ class SeniMatchController extends Controller
                     'team_member_2'     => $teamSize >= 2 ? ($blueTeam['m2'] ?? null) : null,
                     'team_member_3'     => $teamSize >= 3 ? ($blueTeam['m3'] ?? null) : null,
                     'status'            => 'not_started',
-                    'winner_corner'     => 'blue',
                 ]);
-                $currentRound[] = [null, $blue->id];
-                $battleGroup++;
-                continue;
-            }
-
-            // BYE sisi RED
-            if ($blueTeam === null && $redTeam !== null) {
-                $red = \App\Models\SeniMatch::create([
+                $red  = \App\Models\SeniMatch::create([
                     'pool_id'           => $pool->id,
                     'match_order'       => $battleGroup,
                     'battle_group'      => $battleGroup,
@@ -2597,171 +2372,133 @@ class SeniMatchController extends Controller
                     'team_member_2'     => $teamSize >= 2 ? ($redTeam['m2'] ?? null) : null,
                     'team_member_3'     => $teamSize >= 3 ? ($redTeam['m3'] ?? null) : null,
                     'status'            => 'not_started',
-                    'winner_corner'     => 'red',
-                ]);
-                $currentRound[] = [$red->id, null];
-                $battleGroup++;
-                continue;
-            }
-
-            // Normal
-            $blue = \App\Models\SeniMatch::create([
-                'pool_id'           => $pool->id,
-                'match_order'       => $battleGroup,
-                'battle_group'      => $battleGroup,
-                'gender'            => $gender,
-                'match_category_id' => $matchCategoryId,
-                'match_type'        => $matchType,
-                'mode'              => 'battle',
-                'round'             => $round,
-                'round_label'       => $roundLabel,
-                'corner'            => 'blue',
-                'contingent_id'     => $blueTeam['contingent_id'] ?? null,
-                'team_member_1'     => $blueTeam['m1'] ?? null,
-                'team_member_2'     => $teamSize >= 2 ? ($blueTeam['m2'] ?? null) : null,
-                'team_member_3'     => $teamSize >= 3 ? ($blueTeam['m3'] ?? null) : null,
-                'status'            => 'not_started',
-            ]);
-            $red  = \App\Models\SeniMatch::create([
-                'pool_id'           => $pool->id,
-                'match_order'       => $battleGroup,
-                'battle_group'      => $battleGroup,
-                'gender'            => $gender,
-                'match_category_id' => $matchCategoryId,
-                'match_type'        => $matchType,
-                'mode'              => 'battle',
-                'round'             => $round,
-                'round_label'       => $roundLabel,
-                'corner'            => 'red',
-                'contingent_id'     => $redTeam['contingent_id'] ?? null,
-                'team_member_1'     => $redTeam['m1'] ?? null,
-                'team_member_2'     => $teamSize >= 2 ? ($redTeam['m2'] ?? null) : null,
-                'team_member_3'     => $teamSize >= 3 ? ($redTeam['m3'] ?? null) : null,
-                'status'            => 'not_started',
-            ]);
-
-            $currentRound[] = [$red->id, $blue->id];
-            $battleGroup++;
-        }
-
-        // Ronde berikutnya: carry-forward jika 1 parent; buat node + prefill jika 2 parent
-        while (count($currentRound) > 1) {
-            $round++;
-            $roundLabel = $this->getRoundLabel($round, $totalRounds);
-            $nextRound  = [];
-
-            for ($j = 0; $j < count($currentRound); $j += 2) {
-                // format entry: [redMatchId|null, blueMatchId|null]
-                $left  = $currentRound[$j]   ?? [null, null];
-                $right = $currentRound[$j+1] ?? [null, null];
-
-                $blueParent = $left[1]  ?? null; // winner BLUE dari kiri
-                $redParent  = $right[0] ?? null; // winner RED  dari kanan
-
-                if ($blueParent === null && $redParent === null) {
-                    continue;
-                }
-
-                // Hanya satu parent → carry-forward
-                if ($blueParent !== null && $redParent === null) {
-                    $nextRound[] = [null, $blueParent];
-                    continue;
-                }
-                if ($blueParent === null && $redParent !== null) {
-                    $nextRound[] = [$redParent, null];
-                    continue;
-                }
-
-                // Dua parent → buat node normal
-                $blueNode = \App\Models\SeniMatch::create([
-                    'pool_id'              => $pool->id,
-                    'match_order'          => $battleGroup,
-                    'battle_group'         => $battleGroup,
-                    'gender'               => $gender,
-                    'match_category_id'    => $matchCategoryId,
-                    'match_type'           => $matchType,
-                    'mode'                 => 'battle',
-                    'round'                => $round,
-                    'round_label'          => $roundLabel,
-                    'corner'               => 'blue',
-                    'parent_match_blue_id' => $blueParent,
-                    'status'               => 'not_started',
                 ]);
 
-                $redNode = \App\Models\SeniMatch::create([
-                    'pool_id'              => $pool->id,
-                    'match_order'          => $battleGroup,
-                    'battle_group'         => $battleGroup,
-                    'gender'               => $gender,
-                    'match_category_id'    => $matchCategoryId,
-                    'match_type'           => $matchType,
-                    'mode'                 => 'battle',
-                    'round'                => $round,
-                    'round_label'          => $roundLabel,
-                    'corner'               => 'red',
-                    'parent_match_red_id'  => $redParent,
-                    'status'               => 'not_started',
-                ]);
-
-                // Prefill bila parent BYE (tak punya sibling di ronde sebelumnya)
-                $prevRound = $round - 1;
-
-                $pBlue = \App\Models\SeniMatch::find($blueParent);
-                if ($pBlue) {
-                    $siblingBlueExists = \App\Models\SeniMatch::where('pool_id', $pool->id)
-                        ->where('round', $prevRound)
-                        ->where('battle_group', $pBlue->battle_group)
-                        ->where('corner', 'red')
-                        ->exists();
-                    if (!$siblingBlueExists) {
-                        $blueNode->contingent_id = $pBlue->contingent_id;
-                        $blueNode->team_member_1 = $pBlue->team_member_1;
-                        $blueNode->team_member_2 = $pBlue->team_member_2;
-                        $blueNode->team_member_3 = $pBlue->team_member_3;
-                        $blueNode->save();
-                    }
-                }
-
-                $pRed = \App\Models\SeniMatch::find($redParent);
-                if ($pRed) {
-                    $siblingRedExists = \App\Models\SeniMatch::where('pool_id', $pool->id)
-                        ->where('round', $prevRound)
-                        ->where('battle_group', $pRed->battle_group)
-                        ->where('corner', 'blue')
-                        ->exists();
-                    if (!$siblingRedExists) {
-                        $redNode->contingent_id = $pRed->contingent_id;
-                        $redNode->team_member_1 = $pRed->team_member_1;
-                        $redNode->team_member_2 = $pRed->team_member_2;
-                        $redNode->team_member_3 = $pRed->team_member_3;
-                        $redNode->save();
-                    }
-                }
-
-                $nextRound[] = [$redNode->id, $blueNode->id];
+                $currentRound[] = [$red->id, $blue->id];
                 $battleGroup++;
             }
 
-            $currentRound = $nextRound;
+            // ===== Ronde berikutnya: carry-forward kalau hanya 1 parent; buat node + prefill jika 2 parent =====
+            while (count($currentRound) > 1) {
+                $round++;
+                $roundLabel = $this->getRoundLabel($round, $totalRounds);
+                $nextRound  = [];
+
+                for ($j = 0; $j < count($currentRound); $j += 2) {
+                    // format entry: [redMatchId|null, blueMatchId|null]
+                    $left  = $currentRound[$j]   ?? [null, null];
+                    $right = $currentRound[$j+1] ?? [null, null];
+
+                    $blueParent = $left[1]  ?? null; // winner BLUE kiri
+                    $redParent  = $right[0] ?? null; // winner RED  kanan
+
+                    // Dua-duanya kosong → skip
+                    if ($blueParent === null && $redParent === null) {
+                        continue;
+                    }
+
+                    // ⚠️ Hanya satu parent → carry-forward tanpa bikin node
+                    if ($blueParent !== null && $redParent === null) {
+                        $nextRound[] = [null, $blueParent];
+                        continue;
+                    }
+                    if ($blueParent === null && $redParent !== null) {
+                        $nextRound[] = [$redParent, null];
+                        continue;
+                    }
+
+                    // ✅ Dua parent ada → buat node normal, prefill kalau parent BYE (tak punya sibling di ronde prev)
+                    $blueNode = \App\Models\SeniMatch::create([
+                        'pool_id'              => $pool->id,
+                        'match_order'          => $battleGroup,
+                        'battle_group'         => $battleGroup,
+                        'gender'               => $gender,
+                        'match_category_id'    => $matchCategoryId,
+                        'match_type'           => $matchType,
+                        'mode'                 => 'battle',
+                        'round'                => $round,
+                        'round_label'          => $roundLabel,
+                        'corner'               => 'blue',
+                        'parent_match_blue_id' => $blueParent,
+                        'status'               => 'not_started',
+                    ]);
+
+                    $redNode = \App\Models\SeniMatch::create([
+                        'pool_id'              => $pool->id,
+                        'match_order'          => $battleGroup,
+                        'battle_group'         => $battleGroup,
+                        'gender'               => $gender,
+                        'match_category_id'    => $matchCategoryId,
+                        'match_type'           => $matchType,
+                        'mode'                 => 'battle',
+                        'round'                => $round,
+                        'round_label'          => $roundLabel,
+                        'corner'               => 'red',
+                        'parent_match_red_id'  => $redParent,
+                        'status'               => 'not_started',
+                    ]);
+
+                    $prevRound = $round - 1;
+
+                    // Prefill sisi BLUE
+                    $pBlue = \App\Models\SeniMatch::find($blueParent);
+                    if ($pBlue) {
+                        $siblingBlueExists = \App\Models\SeniMatch::where('pool_id', $pool->id)
+                            ->where('round', $prevRound)
+                            ->where('battle_group', $pBlue->battle_group)
+                            ->where('corner', 'red')
+                            ->exists();
+                        if (!$siblingBlueExists) {
+                            $blueNode->contingent_id = $pBlue->contingent_id;
+                            $blueNode->team_member_1 = $pBlue->team_member_1;
+                            $blueNode->team_member_2 = $pBlue->team_member_2;
+                            $blueNode->team_member_3 = $pBlue->team_member_3;
+                            $blueNode->save();
+                        }
+                    }
+
+                    // Prefill sisi RED
+                    $pRed = \App\Models\SeniMatch::find($redParent);
+                    if ($pRed) {
+                        $siblingRedExists = \App\Models\SeniMatch::where('pool_id', $pool->id)
+                            ->where('round', $prevRound)
+                            ->where('battle_group', $pRed->battle_group)
+                            ->where('corner', 'blue')
+                            ->exists();
+                        if (!$siblingRedExists) {
+                            $redNode->contingent_id = $pRed->contingent_id;
+                            $redNode->team_member_1 = $pRed->team_member_1;
+                            $redNode->team_member_2 = $pRed->team_member_2;
+                            $redNode->team_member_3 = $pRed->team_member_3;
+                            $redNode->save();
+                        }
+                    }
+
+                    $nextRound[] = [$redNode->id, $blueNode->id];
+                    $battleGroup++;
+                }
+
+                $currentRound = $nextRound;
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'message'      => 'Regenerate pool (battle) berhasil.',
+                'pool_id'      => $pool->id,
+                'mode'         => 'battle',
+                'teams_count'  => $N,
+                'bracket_size' => $K,
+            ]);
+
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json([
+                'message' => 'Gagal meregenerasi pool.',
+                'error'   => $e->getMessage(),
+            ], 500);
         }
-
-        DB::commit();
-
-        return response()->json([
-            'message' => 'Regenerate pool (battle) berhasil. Tidak membuat dummy pada tahap ini.',
-            'pool_id' => $pool->id,
-            'mode'    => 'battle',
-        ]);
-
-    } catch (\Throwable $e) {
-        DB::rollBack();
-        return response()->json([
-            'message' => 'Gagal meregenerasi pool.',
-            'error'   => $e->getMessage(),
-        ], 500);
     }
-}
-
 
 
     
