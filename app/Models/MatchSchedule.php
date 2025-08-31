@@ -30,14 +30,33 @@ class MatchSchedule extends Model
         return $this->belongsTo(TournamentArena::class, 'tournament_arena_id');
     }
 
+
     public function ageCategory()
     {   
         return $this->belongsTo(AgeCategory::class, 'age_category_id');
     }
 
 
-    public function details()
+    public function details_()
     {
         return $this->hasMany(MatchScheduleDetail::class);
     }
+
+    public function details()
+    {
+        return $this->hasMany(\App\Models\MatchScheduleDetail::class, 'match_schedule_id')
+            ->select([
+                'id',
+                'match_schedule_id',
+                'match_category_id',
+                'tournament_match_id',
+                'seni_match_id',
+                'order',
+                'start_time',
+                'note',
+                'round_label',       // ⬅️ WAJIB ADA
+            ])
+            ->orderBy('order');
+    }
+
 }
