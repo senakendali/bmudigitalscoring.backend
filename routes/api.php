@@ -178,10 +178,16 @@ Route::get('/tournaments/{tournamentId}/available-rounds', [TournamentMatchContr
 
 Route::post('/seni/generate-match', [SeniMatchController::class, 'generate']);
 Route::post('/seni/matches/regenerate', [SeniMatchController::class, 'regenerate']);
+Route::post('/seni/matches/{pool}/regenerate-pool', [SeniMatchController::class, 'regeneratePool']);
+Route::get('/seni/pools/{pool}/bracket', [SeniMatchController::class, 'getMatches']);
+Route::get('/seni/matches/battle', [SeniMatchController::class, 'bracketByPool']);
+
+
 
 Route::get('/seni/matches', [SeniMatchController::class, 'index']);
 Route::get('/seni/match-list', [SeniMatchController::class, 'matchList']);
 Route::get('/seni/participant-counts/', [SeniMatchController::class, 'getParticipantCounts']);
+Route::get('/seni/tournament/{tournamentId}/available-rounds', [SeniMatchController::class, 'getAvailableRounds']);
 
 
 // Tournament Settings

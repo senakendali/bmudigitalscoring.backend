@@ -6,6 +6,8 @@ use Illuminate\Database\Eloquent\Model;
 
 class SeniMatch extends Model
 {
+    // app/Models/SeniMatch.php
+
     protected $fillable = [
         'pool_id',
         'match_order',
@@ -21,15 +23,22 @@ class SeniMatch extends Model
         'team_member_3',
         'final_score',
 
-        // 🔹 tambahan untuk battle mode
+        // Battle mode fields
         'mode',
         'battle_group',
         'round',
+        'round_label',        // ⬅️ tambahkan ini
         'corner',
+        'winner_corner',
         'parent_match_red_id',
         'parent_match_blue_id',
         'status',
     ];
+
+    protected $casts = [
+        'winner_corner' => 'string',
+    ];
+
 
 
     public function tournament()

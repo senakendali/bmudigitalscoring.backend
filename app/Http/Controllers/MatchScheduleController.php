@@ -2428,34 +2428,36 @@ public function export_asli(Request $request)
     public function store(Request $request)
     {
         $request->validate([
-            'tournament_id' => 'required|exists:tournaments,id',
-            'tournament_arena_id' => 'required|exists:tournament_arena,id',
-            'match_category_id' => 'nullable|exists:match_categories,id',
-            'scheduled_date' => 'required|date',
-            'age_category_id' => 'nullable|exists:age_categories,id',
-            'round' => 'nullable|string',
-            'start_time' => 'required',
-            'end_time' => 'nullable',
-            'note' => 'nullable|string',
-            'matches' => 'required|array|min:1',
-            'matches.*.note' => 'nullable|string',
+            'tournament_id'                 => 'required|exists:tournaments,id',
+            'tournament_arena_id'           => 'required|exists:tournament_arena,id',
+            'match_category_id'             => 'nullable|exists:match_categories,id',
+            'scheduled_date'                => 'required|date',
+            'age_category_id'               => 'nullable|exists:age_categories,id',
+            'round'                         => 'nullable|string',
+            'start_time'                    => 'required',
+            'end_time'                      => 'nullable',
+            'note'                          => 'nullable|string',
+            'matches'                       => 'required|array|min:1',
+            'matches.*.note'                => 'nullable|string',
             'matches.*.tournament_match_id' => 'nullable|exists:tournament_matches,id',
-            'matches.*.seni_match_id' => 'nullable|exists:seni_matches,id',
-            'matches.*.start_time' => 'nullable',
+            'matches.*.seni_match_id'       => 'nullable|exists:seni_matches,id',
+            'matches.*.start_time'          => 'nullable',
+            // optional kalau kamu mau dukung round label per-item utk tanding:
+            // 'matches.*.round_label'      => 'nullable|string',
         ]);
 
+        // Cek duplikasi utk tanding (tetap seperti semula)
         $tandingIds = collect($request->matches)
             ->pluck('tournament_match_id')
             ->filter()
             ->toArray();
 
         $exists = false;
-
         if (!empty($tandingIds)) {
             $exists = \App\Models\MatchScheduleDetail::whereIn('tournament_match_id', $tandingIds)
                 ->whereHas('schedule', function ($q) use ($request) {
                     $q->where('tournament_id', $request->tournament_id)
-                        ->whereDate('scheduled_date', $request->scheduled_date);
+                    ->whereDate('scheduled_date', $request->scheduled_date);
                 })->exists();
         }
 
@@ -2466,111 +2468,134 @@ public function export_asli(Request $request)
         DB::beginTransaction();
 
         try {
-            // ✅ Deteksi jika ini adalah match Seni
+            // ✅ Deteksi konteks SENI — hanya set age_category_id bila kosong.
+            // ❌ JANGAN merge round_label=Final lagi di sini.
             $firstSeniMatch = collect($request->matches)->firstWhere('seni_match_id');
-
             if ($firstSeniMatch) {
                 $seni = \App\Models\SeniMatch::find($firstSeniMatch['seni_match_id']);
-                if ($seni) {
+                if ($seni && empty($request->age_category_id)) {
                     $request->merge([
-                        'age_category_id' => $request->age_category_id ?? $seni->age_category_id,
-                        'round_label' => 'Final',
+                        'age_category_id' => $seni->age_category_id,
                     ]);
                 }
             }
 
+            // Header jadwal — pakai round_label dari request kalau ada, kalau tidak biarkan null
             $schedule = \App\Models\MatchSchedule::create([
-                'tournament_id' => $request->tournament_id,
+                'tournament_id'       => $request->tournament_id,
                 'tournament_arena_id' => $request->tournament_arena_id,
-                'scheduled_date' => $request->scheduled_date,
-                'start_time' => $request->start_time,
-                'end_time' => $request->end_time,
-                'note' => $request->note,
-                'age_category_id' => $request->age_category_id,
-                'round_label' => $request->round_label,
+                'scheduled_date'      => $request->scheduled_date,
+                'start_time'          => $request->start_time,
+                'end_time'            => $request->end_time,
+                'note'                => $request->note,
+                'age_category_id'     => $request->age_category_id,
+                'round_label'         => $request->round_label, // tidak dipaksa "Final"
             ]);
 
-            /*$lastOrderTanding = \App\Models\MatchScheduleDetail::whereNotNull('tournament_match_id')
-                ->whereHas('schedule', function ($q) use ($request) {
-                    $q->where('tournament_id', $request->tournament_id)
-                        ->where('tournament_arena_id', $request->tournament_arena_id)
-                        ->whereDate('scheduled_date', $request->scheduled_date);
-                })->max('order') ?? 0;
-
-            $lastOrderSeni = \App\Models\MatchScheduleDetail::whereNotNull('seni_match_id')
-                ->whereHas('schedule', function ($q) use ($request) {
-                    $q->where('tournament_id', $request->tournament_id)
-                        ->where('tournament_arena_id', $request->tournament_arena_id)
-                        ->whereDate('scheduled_date', $request->scheduled_date);
-                })->max('order') ?? 0;*/
-
+            // Ambil "last order" global di arena tsb (tetap)
             $lastOrderGlobal = \App\Models\MatchScheduleDetail::whereHas('schedule', function ($q) use ($request) {
                 $q->where('tournament_id', $request->tournament_id)
-                ->where('tournament_arena_id', $request->tournament_arena_id); // ⬅️ Hapus whereDate
+                ->where('tournament_arena_id', $request->tournament_arena_id);
             })->max('order') ?? 0;
 
+            // Pisahkan input: tanding vs seni
+            $items       = collect($request->matches);
+            $tandingList = $items->filter(fn($m) => !empty($m['tournament_match_id']))->values();
+            $seniList    = $items->filter(fn($m) => !empty($m['seni_match_id']))->values();
 
+            // 1) SIMPAN TANDING (order naik per item seperti sebelumnya)
+            foreach ($tandingList as $match) {
+                $schedule->details()->create([
+                    'tournament_match_id' => $match['tournament_match_id'],
+                    'order'               => ++$lastOrderGlobal,
+                    'start_time'          => $match['start_time'] ?? null,
+                    'note'                => $match['note'] ?? null,
+                    'match_category_id'   => $request->match_category_id,
+                    // pakai per-item kalau ada, fallback ke header; tapi TIDAK dipaksa "Final"
+                    'round_label'         => $match['round_label'] ?? $request->round_label,
+                ]);
+            }
 
-            foreach ($request->matches as $match) {
-                $data = [
-                    'start_time' => $match['start_time'] ?? null,
-                    'note' => $match['note'] ?? null,
-                    'match_category_id' => $request->match_category_id,
-                    'round_label' => $request->round_label,
-                ];
+            // 2) SIAPKAN DATA SENI (normalisasi order pada mode battle)
+            if ($seniList->isNotEmpty()) {
+                // Ambil semua seni matches terkait (1x query)
+                $seniIds    = $seniList->pluck('seni_match_id')->unique()->values();
+                $seniModels = \App\Models\SeniMatch::whereIn('id', $seniIds)->get([
+                    'id','pool_id','mode','match_category_id','round','round_label',
+                    'battle_group','corner','contingent_id','team_member_1','team_member_2','team_member_3'
+                ])->keyBy('id');
 
-                if (!empty($match['tournament_match_id'])) {
-                    $data['tournament_match_id'] = $match['tournament_match_id'];
-                    $data['order'] = ++$lastOrderGlobal;
+                // Bagi jadi: battle groups vs non-battle
+                $battleGroups = []; // key: pool-round-battle_group => list of payloads
+                $seniSingles  = [];
 
-                }
+                foreach ($seniList as $row) {
+                    $model = $seniModels[$row['seni_match_id']] ?? null;
+                    if (!$model) continue;
 
-                if (!empty($match['seni_match_id'])) {
-                    $seni = \App\Models\SeniMatch::find($match['seni_match_id']);
-                    if ($seni) {
-                        $data['seni_match_id'] = $seni->id;
-                        $data['match_category_id'] = $seni->match_category_id;
-                        $data['order'] = ++$lastOrderGlobal;
-
+                    if ($model->mode === 'battle') {
+                        $gkey = $model->pool_id . '-' . $model->round . '-' . $model->battle_group;
+                        $battleGroups[$gkey][] = ['input' => $row, 'seni' => $model];
+                    } else {
+                        $seniSingles[] = ['input' => $row, 'seni' => $model];
                     }
                 }
 
-                $schedule->details()->create($data);
+                // 2a) NON-BATTLE: order naik per item
+                foreach ($seniSingles as $it) {
+                    $m  = $it['seni'];
+                    $in = $it['input'];
+
+                    $schedule->details()->create([
+                        'seni_match_id'     => $m->id,
+                        'match_category_id' => $m->match_category_id,
+                        'order'             => ++$lastOrderGlobal,
+                        'start_time'        => $in['start_time'] ?? null,
+                        'note'              => $in['note'] ?? null,
+                        // ⬇️ SELALU pakai round_label dari match SENI agar akurat
+                        'round_label'       => $m->round_label,
+                    ]);
+                }
+
+                // 2b) BATTLE: order DISAMAKAN per (pool_id, round, battle_group)
+                foreach ($battleGroups as $gkey => $list) {
+                    $groupOrder = ++$lastOrderGlobal; // sama utk blue & red
+
+                    foreach ($list as $it) {
+                        $m  = $it['seni'];
+                        $in = $it['input'];
+
+                        $schedule->details()->create([
+                            'seni_match_id'     => $m->id,
+                            'match_category_id' => $m->match_category_id,
+                            'order'             => $groupOrder,
+                            'start_time'        => $in['start_time'] ?? null,
+                            'note'              => $in['note'] ?? null,
+                            // ⬇️ SELALU pakai round_label dari match SENI
+                            'round_label'       => $m->round_label,
+                        ]);
+                    }
+                }
             }
 
             DB::commit();
 
             return response()->json([
                 'message' => 'Match schedule created successfully',
-                'data' => $schedule->load('details')
+                'data'    => $schedule->load('details')
             ], 201);
+
         } catch (\Exception $e) {
             DB::rollBack();
             return response()->json([
-                'error' => 'Failed to create match schedule',
+                'error'   => 'Failed to create match schedule',
                 'message' => $e->getMessage()
             ], 500);
         }
     }
 
 
-   
 
-
-
-
-
-
-    
-
-
-
-
-    
-
-
-
-    
 
     public function update(Request $request, $id)
     {

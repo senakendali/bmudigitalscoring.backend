@@ -1942,6 +1942,143 @@ public function export(Request $request)
 
         $pool = $match->pool;
         $round = $match->round ?? 0;
+        $roundLabel = $detail->round_label ?? '-';
+
+        $categoryClass = optional($pool->categoryClass);
+        $ageCategory = optional($pool->ageCategory);
+        $ageCategoryName = $ageCategory->name ?? 'Tanpa Usia';
+        $className = $ageCategoryName . ' ' . ($categoryClass->name ?? 'Tanpa Kelas');
+
+        $genderRaw = $categoryClass->gender ?? null;
+        $gender = $genderRaw === 'male' ? 'Putra' : ($genderRaw === 'female' ? 'Putri' : '-');
+
+        $participantOneName = optional($match->participantOne)->name;
+        $participantTwoName = optional($match->participantTwo)->name;
+
+        if (!$participantOneName && $match->parent_match_blue_id) {
+            $blueParentOrder = MatchScheduleDetail::where('tournament_match_id', $match->parent_match_blue_id)->value('order')
+                ?? MatchScheduleDetail::where('tournament_match_id', $match->parent_match_red_id)->value('order');
+
+            $participantOneName = $blueParentOrder
+                ? 'Pemenang dari Partai #' . $blueParentOrder
+                : 'Pemenang dari Pertandingan Sebelumnya';
+        }
+
+        if (!$participantTwoName && $match->parent_match_red_id) {
+            $redParentOrder = MatchScheduleDetail::where('tournament_match_id', $match->parent_match_red_id)->value('order')
+                ?? MatchScheduleDetail::where('tournament_match_id', $match->parent_match_blue_id)->value('order');
+
+            $participantTwoName = $redParentOrder
+                ? 'Pemenang dari Partai #' . $redParentOrder
+                : 'Pemenang dari Pertandingan Sebelumnya';
+        }
+
+        if (!isset($result[$groupKey])) {
+            $result[$groupKey] = [
+                'arena_name' => $arena,
+                'scheduled_date' => $date,
+                'tournament_name' => $tournament->name ?? '-',
+                'matches' => [],
+            ];
+        }
+
+        // Atur label peserta untuk BYE Semi/Final jika perlu
+        if ($participantTwoName == 'Pemenang dari Pertandingan Sebelumnya' && $roundLabel == '1/4 Final') {
+            $participantTwoName = 'Jadwal BYE Semi';
+        }
+
+        if ($participantTwoName == 'Pemenang dari Pertandingan Sebelumnya' && $roundLabel == 'Semifinal') {
+            $participantTwoName = 'Jadwal BYE Final';
+        }
+
+        $result[$groupKey]['matches'][] = [
+            'pool_id' => $pool->id ?? null,
+            'pool_name' => $pool->name ?? 'Tanpa Pool',
+            'round' => $round,
+            'round_label' => $roundLabel,
+            'match_number' => $detail->order,
+            'match_order' => $detail->order,
+            'match_time' => $detail->start_time,
+            'participant_one' => $participantOneName,
+            'participant_two' => $participantTwoName,
+            'contingent_one' => optional(optional($match->participantOne)->contingent)->name,
+            'contingent_two' => optional(optional($match->participantTwo)->contingent)->name,
+            'class_name' => $className . ' (' . $gender . ' )',
+            'age_category_id' => $ageCategory->id ?? 0,
+            'age_category_name' => $ageCategoryName,
+            'gender' => $gender,
+        ];
+    }
+
+    // Buat final array yang siap dikirim ke view
+    $final = [];
+
+    foreach ($result as $entry) {
+        $matches = collect($entry['matches'])->sortBy('match_order')->values();
+
+        $final[] = [
+            'arena_name' => $entry['arena_name'],
+            'scheduled_date' => $entry['scheduled_date'],
+            'tournament_name' => $entry['tournament_name'],
+            'matches' => $matches,
+        ];
+    }
+
+    $pdf = \Barryvdh\DomPDF\Facade\Pdf::loadView('exports.tanding-schedule', ['data' => $final]);
+    return $pdf->download("Jadwal_{$arenaName}_{$scheduledDate}.pdf");
+}
+
+
+public function export_asli(Request $request)
+{
+    $arenaName = $request->query('arena_name');
+    $scheduledDate = $request->query('scheduled_date');
+
+    $query = MatchScheduleDetail::with([
+        'schedule.arena',
+        'schedule.tournament',
+        'tournamentMatch.participantOne.contingent',
+        'tournamentMatch.participantTwo.contingent',
+        'tournamentMatch.pool.categoryClass',
+        'tournamentMatch.pool.ageCategory',
+        'tournamentMatch.pool',
+    ])
+    ->whereHas('schedule', function ($q) use ($scheduledDate, $arenaName) {
+        $q->when($scheduledDate, fn($q) => $q->where('scheduled_date', $scheduledDate))
+          ->whereHas('arena', fn($q) => $q->where('name', $arenaName));
+    })
+    ->whereHas('tournamentMatch')
+    ->join('tournament_matches', 'match_schedule_details.tournament_match_id', '=', 'tournament_matches.id')
+    ->join('pools', 'tournament_matches.pool_id', '=', 'pools.id')
+    ->orderBy('match_schedule_details.order')
+    ->select('match_schedule_details.*');
+
+    $details = $query->get();
+
+    if ($details->isEmpty()) {
+        $pdf = \Barryvdh\DomPDF\Facade\Pdf::loadView('exports.tanding-schedule', ['data' => []]);
+        return $pdf->download("Jadwal_{$arenaName}_{$scheduledDate}_Kosong.pdf");
+    }
+
+    $tournament = $details->first()?->schedule?->tournament;
+    $result = [];
+
+    foreach ($details as $detail) {
+        $match = $detail->tournamentMatch;
+
+        $isByeMatch = (
+            ($match->participant_1 === null || $match->participant_2 === null)
+            && $match->winner_id !== null
+            && $match->next_match_id !== null
+        );
+        if ($isByeMatch) continue;
+
+        $arena = $detail->schedule->arena->name ?? 'Tanpa Arena';
+        $date = $detail->schedule->scheduled_date;
+        $groupKey = $arena . '||' . $date;
+
+        $pool = $match->pool;
+        $round = $match->round ?? 0;
 
         $categoryClass = optional($pool->categoryClass);
         $ageCategory = optional($pool->ageCategory);
@@ -2369,9 +2506,9 @@ public function export(Request $request)
 
             $lastOrderGlobal = \App\Models\MatchScheduleDetail::whereHas('schedule', function ($q) use ($request) {
                 $q->where('tournament_id', $request->tournament_id)
-                ->where('tournament_arena_id', $request->tournament_arena_id)
-                ->whereDate('scheduled_date', $request->scheduled_date);
+                ->where('tournament_arena_id', $request->tournament_arena_id); // ⬅️ Hapus whereDate
             })->max('order') ?? 0;
+
 
 
             foreach ($request->matches as $match) {
@@ -2417,136 +2554,7 @@ public function export(Request $request)
     }
 
 
-   public function store_asli(Request $request)
-    {
-        $request->validate([
-            'tournament_id' => 'required|exists:tournaments,id',
-            'tournament_arena_id' => 'required|exists:tournament_arena,id',
-            'match_category_id' => 'nullable|exists:match_categories,id',
-            'scheduled_date' => 'required|date',
-            'age_category_id' => 'nullable|exists:age_categories,id',
-            'round' => 'nullable|string',
-            'start_time' => 'required',
-            'end_time' => 'nullable',
-            'note' => 'nullable|string',
-            'matches' => 'required|array|min:1',
-            'matches.*.note' => 'nullable|string',
-            'matches.*.tournament_match_id' => 'nullable|exists:tournament_matches,id',
-            'matches.*.seni_match_id' => 'nullable|exists:seni_matches,id',
-            'matches.*.start_time' => 'nullable',
-        ]);
-
-        $tandingIds = collect($request->matches)
-            ->pluck('tournament_match_id')
-            ->filter()
-            ->toArray();
-
-        $exists = false;
-
-        if (!empty($tandingIds)) {
-            $exists = \App\Models\MatchScheduleDetail::whereIn('tournament_match_id', $tandingIds)
-                ->whereHas('schedule', function ($q) use ($request) {
-                    $q->where('tournament_id', $request->tournament_id)
-                        ->whereDate('scheduled_date', $request->scheduled_date);
-                })->exists();
-        }
-
-        if ($exists) {
-            return response()->json(['error' => 'Some matches are already scheduled on this date'], 422);
-        }
-
-        DB::beginTransaction();
-
-        try {
-
-            // ✅ Khusus untuk SENI: paksa isi age_category_id dan round_label
-            $hasSeni = collect($request->matches)
-                ->pluck('seni_match_id')
-                ->filter()
-                ->isNotEmpty();
-
-            if ($hasSeni) {
-                // Jika belum diset dari frontend, paksa isi
-                if (!$request->filled('age_category_id')) {
-                    $firstSeni = \App\Models\SeniMatch::find($request->matches[0]['seni_match_id']);
-                    if ($firstSeni) {
-                        $request->merge([
-                            'age_category_id' => $firstSeni->age_category_id ?? null,
-                        ]);
-                    }
-                }
-
-                // Paksa label jadi "Final"
-                $request->merge([
-                    'round_label' => 'Final',
-                ]);
-            }
-
-
-            $schedule = \App\Models\MatchSchedule::create([
-                'tournament_id' => $request->tournament_id,
-                'tournament_arena_id' => $request->tournament_arena_id,
-                'scheduled_date' => $request->scheduled_date,
-                'start_time' => $request->start_time,
-                'end_time' => $request->end_time,
-                'note' => $request->note,
-                'age_category_id' => $request->age_category_id,
-                'round_label' => $request->round_label,
-            ]);
-
-            $lastOrderTanding = \App\Models\MatchScheduleDetail::whereNotNull('tournament_match_id')
-                ->whereHas('schedule', function ($q) use ($request) {
-                    $q->where('tournament_id', $request->tournament_id)
-                        ->where('tournament_arena_id', $request->tournament_arena_id)
-                        ->whereDate('scheduled_date', $request->scheduled_date);
-                })->max('order') ?? 0;
-
-            $lastOrderSeni = \App\Models\MatchScheduleDetail::whereNotNull('seni_match_id')
-                ->whereHas('schedule', function ($q) use ($request) {
-                    $q->where('tournament_id', $request->tournament_id)
-                        ->where('tournament_arena_id', $request->tournament_arena_id)
-                        ->whereDate('scheduled_date', $request->scheduled_date);
-                })->max('order') ?? 0;
-
-            foreach ($request->matches as $match) {
-                $data = [
-                    'start_time' => $match['start_time'] ?? null,
-                    'note' => $match['note'] ?? null,
-                    'match_category_id' => $request->match_category_id,
-                    'round_label' => $request->round_label,
-                ];
-
-                if (!empty($match['tournament_match_id'])) {
-                    $data['tournament_match_id'] = $match['tournament_match_id'];
-                    $data['order'] = ++$lastOrderTanding;
-                }
-
-                if (!empty($match['seni_match_id'])) {
-                    $seni = \App\Models\SeniMatch::find($match['seni_match_id']);
-                    if ($seni) {
-                        $data['seni_match_id'] = $seni->id;
-                        $data['match_category_id'] = $seni->match_category_id;
-                        $data['order'] = ++$lastOrderSeni;
-                    }
-                }
-
-                $schedule->details()->create($data);
-            }
-
-            DB::commit();
-
-            return response()->json([
-                'message' => 'Match schedule created successfully',
-                'data' => $schedule->load('details')
-            ], 201);
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'error' => 'Failed to create match schedule',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
+   
 
 
 
