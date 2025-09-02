@@ -1192,8 +1192,8 @@ class SeniMatchController extends Controller
 
     $filename = 'jadwal-' . str_replace(' ', '-', strtolower($arena)) . '-' . $date . '.pdf';
 
-    //return $pdf->download($filename);
-    return $pdf->stream($filename);
+    return $pdf->download($filename);
+    //return $pdf->stream($filename);
 }
 
 
