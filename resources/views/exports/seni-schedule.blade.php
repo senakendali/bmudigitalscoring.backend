@@ -4,166 +4,157 @@
     <meta charset="UTF-8">
     <title>Jadwal Pertandingan Seni</title>
     <style>
-        body {
-            font-family: sans-serif;
-            font-size: 12px;
-            color: #333;
-        }
-
-        h4, h5 {
-            margin: 0;
-            padding: 0;
-            font-size:18px;
-        }
-
+        body { font-family: sans-serif; font-size: 12px; color: #333; }
+        h4, h5 { margin: 0; padding: 0; font-size:18px; }
         .text-center { text-align: center; }
-        .text-left { text-align: left; }
-        .text-right { text-align: right; }
         .fw-bold { font-weight: bold; }
-        .blue { color: #007bff; }
-        .red { color: #dc3545; }
-        .text-success { color: #28a745; }
         .uppercase { text-transform: uppercase; }
-        .table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-bottom: 40px;
-        }
-        .table th, .table td {
-            padding: 6px;
-            font-size: 11px;
-        }
-        .table th {
-            
-            font-weight: bold;
-        }
 
-        .table tbody tr:nth-child(even) {
-            background-color: #f2f2f2;
-        }
+        .table { width: 100%; border-collapse: collapse; margin-bottom: 22px; }
+        .table th, .table td { padding: 8px; font-size: 11px; border-bottom: 1px solid #ddd; }
+        .table thead th { font-weight: bold; }
+        .table tbody tr:nth-child(even) { background-color: #f7f7f7; }
 
+        .logo { width: 120px; }
 
-        .logo {
-            width: 120px;
-        }
+        .soft-dark { background-color:#495057; color:#FFFFFF; height:50px; }
+        .dark      { background-color:#343A40; color:#FFFFFF; }
 
-        .header-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 10px;
-        }
+        .blue-corner { background-color:#002FB9; color:#FFFFFF; }
+        .red-corner  { background-color:#F80000; color:#FFFFFF; }
 
-        .header-col {
-            flex: 1;
-        }
-
-        .header-center {
-            text-align: center;
-        }
-
-        .header-right {
-            text-align: right;
-        }
-
-        .mt-3 { margin-top: 1rem; }
-
-        .table td,
-        .table th {
-            padding: 20px; /* atas-bawah 8px, kiri-kanan 6px */
-        }
-
-        .table th {
-           text-transform:uppercase;
-        }
-
-        .soft-dark{
-            background-color:#495057;
-            color:#FFFFFF;
-        }
-
-        .dark{
-            background-color:#343A40;
-            color:#FFFFFF;
-        }
-
-        .blue-corner{
-            background-color:#002FB9;
-            color:#FFFFFF;
-        }
-
-        .red-corner{
-            background-color:#F80000;
-            color:#FFFFFF;
-        }
-
+        .contingent { font-style: italic; font-size: 10px; opacity: .95; }
+        .names { line-height: 1.2rem; }
     </style>
 </head>
 <body>
 
-    
-
+    {{-- HEADER --}}
     <table style="width: 100%; margin-bottom: 10px;">
         <tr>
             <td style="width: 25%;">
-            <img src="{{ public_path('images/ipsi.png') }}" class="logo">
+                <img src="{{ public_path('images/ipsi.png') }}" class="logo">
             </td>
             <td style="width: 50%; text-align: center;">
-            <h4 class="uppercase fw-bold">JADWAL {{ $data['arena_name'] }}</h4>
-            <h4 class="uppercase fw-bold">{{ $data['tournament_name'] }}</h4>
-            <div class="uppercase fw-bold">
-                {{ \Carbon\Carbon::parse($data['scheduled_date'])->translatedFormat('d F Y') }}
-            </div>
+                <h4 class="uppercase fw-bold">JADWAL {{ $data['arena_name'] }}</h4>
+                <h4 class="uppercase fw-bold">{{ $data['tournament_name'] }}</h4>
+                <div class="uppercase fw-bold">
+                    {{ \Carbon\Carbon::parse($data['scheduled_date'])->translatedFormat('d F Y') }}
+                </div>
             </td>
             <td style="width: 25%;"></td>
         </tr>
     </table>
 
-    @foreach ($data['groups'] as $group)
-        @foreach ($group['pools'] as $pool)
-           
+    {{-- ===================== BATTLE: SATU TABEL GABUNGAN ===================== --}}
+    @if(!empty($battle_rows))
+        <table class="table">
+            <thead>
+                <tr>
+                    <th class="soft-dark">PARTAI</th>
+                    <th class="soft-dark">BABAK</th>
+                    <th class="soft-dark">KELAS</th>
+                    <th class="soft-dark text-center" colspan="2">PESERTA</th>
+                    <th class="soft-dark text-center" colspan="2">WAKTU</th>
+                    <th class="soft-dark text-center" colspan="2">SCORE</th>
+                </tr>
+            </thead>
+            <tbody>
+            @foreach($battle_rows as $row)
+                <tr>
+                    <td>{{ $row['order'] }}</td>
+                    <td class="uppercase">{{ $row['round_label'] ?? '-' }}</td>
+                    <td class="uppercase">{{ $row['class_label'] ?? '-' }}</td>
+
+                    {{-- BLUE --}}
+                    <td class="blue-corner" style="width: 25%;">
+                        @php $bn = $row['blue']['names'] ?? null; $bc = $row['blue']['contingent'] ?? null; @endphp
+                        @if($bn)
+                            <div class="names">{{ $bn }}</div>
+                        @elseif(!empty($row['source_blue_order']))
+                            Pemenang Partai #{{ $row['source_blue_order'] }}
+                        @else
+                            -
+                        @endif
+                        @if($bc)
+                            <div class="contingent">{{ $bc }}</div>
+                        @endif
+                    </td>
+
+                    {{-- RED --}}
+                    <td class="red-corner" style="width: 25%;">
+                        @php $rn = $row['red']['names'] ?? null; $rc = $row['red']['contingent'] ?? null; @endphp
+                        @if($rn)
+                            <div class="names">{{ $rn }}</div>
+                        @elseif(!empty($row['source_red_order']))
+                            Pemenang Partai #{{ $row['source_red_order'] }}
+                        @else
+                            -
+                        @endif
+                        @if($rc)
+                            <div class="contingent">{{ $rc }}</div>
+                        @endif
+                    </td>
+
+                    {{-- waktu/score kiri-kanan (simetris) --}}
+                    <td class="text-center">{{ $row['time']  ?? '-' }}</td>
+                    <td class="text-center">{{ $row['time']  ?? '-' }}</td>
+                    <td class="text-center">{{ $row['score'] ?? '-' }}</td>
+                    <td class="text-center">{{ $row['score'] ?? '-' }}</td>
+                </tr>
+            @endforeach
+            </tbody>
+        </table>
+    @endif
+
+    {{-- ===================== NON-BATTLE: PER POOL ===================== --}}
+    @if(!empty($non_battle_tables))
+        @foreach($non_battle_tables as $tb)
             <table class="table">
                 <thead>
                     <tr>
-                        <th class="soft-dark">Partai</th>
-                        <th class="soft-dark">Kontingen</th>
-                        <th colspan="3" class="soft-dark">Nama Atlet</th>
-                        <th class="soft-dark">Waktu</th>
-                        <th class="soft-dark">Score</th>
+                        <th class="soft-dark">PARTAI</th>
+                        <th class="soft-dark">KONTINGEN</th>
+                        <th class="soft-dark" colspan="3">NAMA ATLET</th>
+                        <th class="soft-dark text-center">WAKTU</th>
+                        <th class="soft-dark text-center">SCORE</th>
                     </tr>
-                     <tr>
-                        <th colspan="7" class="dark">
-                        {{ $group['category'] }} {{ $group['gender'] === 'male' ? 'PUTRA' : 'PUTRI' }} - {{ $group['age_category'] }} - {{ $pool['name'] }}
+                    <tr>
+                        <th colspan="7" class="dark text-center fw-bold uppercase">
+                            {{ $tb['title']['category'] }}
+                            {{ $tb['title']['gender'] === 'male' ? 'PUTRA' : 'PUTRI' }}
+                            {{ strtoupper($tb['title']['age'] ?? '-') }} - {{ $tb['title']['pool'] }}
                         </th>
                     </tr>
                 </thead>
                 <tbody>
-                    @foreach ($pool['matches'] as $match)
+                    @foreach($tb['rows'] as $m)
                         <tr>
-                            <td>{{ $match['match_order'] }}</td>
-                            <td>{{ $match['contingent']['name'] ?? '-' }}</td>
+                            <td>{{ $m['match_order'] ?? '-' }}</td>
+                            <td>{{ $m['contingent']['name'] ?? '-' }}</td>
 
-                            @if ($match['match_type'] === 'seni_tunggal')
-                                <td>{{ $match['team_member1']['name'] ?? '-' }}</td>
-                                <td colspan="2">-</td>
-                            @elseif ($match['match_type'] === 'seni_ganda')
-                                <td>{{ $match['team_member1']['name'] ?? '-' }}</td>
-                                <td>{{ $match['team_member2']['name'] ?? '-' }}</td>
+                            @if (($m['match_type'] ?? '') === 'seni_tunggal')
+                                <td colspan="3">{{ $m['team_member1']['name'] ?? '-' }}</td>
+                            @elseif (($m['match_type'] ?? '') === 'seni_ganda')
+                                <td>{{ $m['team_member1']['name'] ?? '-' }}</td>
+                                <td>{{ $m['team_member2']['name'] ?? '-' }}</td>
                                 <td>-</td>
-                            @elseif ($match['match_type'] === 'seni_regu')
-                                <td>{{ $match['team_member1']['name'] ?? '-' }}</td>
-                                <td>{{ $match['team_member2']['name'] ?? '-' }}</td>
-                                <td>{{ $match['team_member3']['name'] ?? '-' }}</td>
+                            @elseif (($m['match_type'] ?? '') === 'seni_regu')
+                                <td>{{ $m['team_member1']['name'] ?? '-' }}</td>
+                                <td>{{ $m['team_member2']['name'] ?? '-' }}</td>
+                                <td>{{ $m['team_member3']['name'] ?? '-' }}</td>
+                            @else
+                                <td colspan="3">{{ $m['team_member1']['name'] ?? '-' }}</td>
                             @endif
 
-                            <td>{{ $match['match_time'] ?? '-' }}</td>
-                            <td>{{ $match['final_score'] ?? '-' }}</td>
+                            <td class="text-center">{{ $m['match_time'] ?? '-' }}</td>
+                            <td class="text-center">{{ $m['final_score'] ?? '-' }}</td>
                         </tr>
                     @endforeach
                 </tbody>
             </table>
         @endforeach
-    @endforeach
+    @endif
 
 </body>
 </html>
