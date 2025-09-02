@@ -378,7 +378,6 @@ class TournamentMatchController extends Controller
             $dummyContingentPool = [310, 311, 312, 313, 314, 315];
 
             $makeDummyFor = function ($templateTmId, $gender = null) use ($pool, $dummyContingentPool) {
-                // pastikan contingent dummy ada
                 if (method_exists($this, 'ensureContingentsExist')) {
                     $this->ensureContingentsExist($dummyContingentPool, $pool->tournament_id);
                 }
@@ -403,11 +402,9 @@ class TournamentMatchController extends Controller
                         [
                             'match_category_id' => $pool->match_category_id,
                             'category_class_id' => $pool->category_class_id,
-                            // 'age_category_id' => $pool->age_category_id ?? $template?->age_category_id,
                         ]
                     );
 
-                    // ambil id team_member dummy yang baru di-assign ke pool ini
                     return DB::table('tournament_participants as tp')
                         ->join('team_members as tm', 'tp.team_member_id', '=', 'tm.id')
                         ->where('tp.tournament_id', $pool->tournament_id)
@@ -447,7 +444,7 @@ class TournamentMatchController extends Controller
                 return $dummyTmId;
             };
 
-            // Hindari peserta yang sudah dipakai di turnamen lain
+            // Hindari peserta yang sudah dipakai di pool lain di turnamen yang sama
             $usedParticipantIds = TournamentMatch::whereHas('pool', fn($q) =>
                 $q->where('tournament_id', $pool->tournament_id)
             )->pluck('participant_1')
@@ -459,17 +456,17 @@ class TournamentMatchController extends Controller
 
             $participants = $participants->reject(fn($p) => $usedParticipantIds->contains($p->id))->values();
 
-            // Ambil maksimal 6
-            $selected      = $participants->slice(0, 6)->values();
+            // Ambil maksimal 6 untuk pool ini
+            $selected       = $participants->slice(0, 6)->values();
             $participantIds = $selected->pluck('id')->toArray();
 
-            // Assign ke pool
+            // Assign ke pool ini
             TournamentParticipant::whereIn('team_member_id', $participantIds)
                 ->where('tournament_id', $pool->tournament_id)
                 ->update(['pool_id' => $poolId]);
 
-            // === NEW: kalau sisa 1 orang (jumlah ganjil), tambahkan 1 dummy agar ROUND 1 selalu match, bukan BYE ===
-            if ($selected->count() % 2 === 1) {
+            // === HANYA buat dummy kalau pool ini isinya TEPAT 1 peserta ===
+            if ($selected->count() === 1) {
                 $tpl = $selected->first();
                 $dummyId = $makeDummyFor($tpl->id, $tpl->gender ?? null);
                 if ($dummyId) {
@@ -482,7 +479,7 @@ class TournamentMatchController extends Controller
                 }
             }
 
-            // Handle khusus 5 & 6 peserta (tetap mengikuti flow lama)
+            // Handle khusus 5 & 6 peserta (TIDAK bikin dummy)
             if ($selected->count() === 5) {
                 return $this->generateBracketForFive($poolId, $selected);
             }
@@ -505,7 +502,7 @@ class TournamentMatchController extends Controller
             $maxRound = (int) ceil(log($slot, 2));
             $byeCount = $slot - count($queue);
 
-            // BYE masih mungkin (mis. jumlah 2 → slot 2 = 0 bye, jumlah 4 → slot 4 = 0 bye, jumlah 3 → kita sudah jadikan 4 dengan dummy)
+            // BYE hanya untuk menyesuaikan slot power-of-two (bukan karena sisa 1; itu sudah ditangani di atas)
             for ($i = 0; $i < $byeCount; $i++) {
                 $queue[] = null;
             }
@@ -515,9 +512,6 @@ class TournamentMatchController extends Controller
                 $p1 = $queue[$i] ?? null;
                 $p2 = $queue[$i + 1] ?? null;
 
-                // Note: kalau salah satu null karena slot power-of-two, itu BYE (tetap auto-winner).
-                // Kasus "sisa 1 orang" sudah kita tangani sebelumnya dengan menambah dummy,
-                // jadi di sini BYE hanya untuk menyesuaikan slot, bukan karena sisa 1 peserta.
                 $winner = ($p1 && !$p2) ? $p1 : (($p2 && !$p1) ? $p2 : null);
 
                 $matchId = DB::table('tournament_matches')->insertGetId([
@@ -583,11 +577,12 @@ class TournamentMatchController extends Controller
                 ->get();
 
             return response()->json([
-                'message' => 'Bracket untuk ' . $selected->count() . ' peserta berhasil dibuat (sisa 1 dipasangkan dummy).',
+                'message' => 'Bracket untuk ' . $selected->count() . ' peserta berhasil dibuat (dummy hanya untuk pool 1 peserta).',
                 'rounds'  => $inserted,
             ]);
         });
     }
+
 
 
 
