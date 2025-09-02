@@ -1084,7 +1084,7 @@ class SeniMatchController extends Controller
     ->orderBy('pool_id')
     ->orderBy('match_order');
 
-    // Exclude yang sudah dijadwalkan (kecuali mode edit)
+    // Exclude yang sudah dijadwalkan (kecuali diminta include)
     if (!$includeScheduled) {
         $query->whereNotExists(function ($sub) {
             $sub->select(DB::raw(1))
@@ -1109,10 +1109,10 @@ class SeniMatchController extends Controller
 
     /**
      * ====== HIDE BYE HANYA DI BABAK AWAL PER POOL (MODE BATTLE) ======
-     * - Tentukan earliest round per pool (mis. 1, bisa >1 kalau bracket tertentu)
-     * - Untuk setiap battle_group, cek jumlah entri di earliest round pool tsb.
-     * - Jika jumlah entri < 2 ⇒ itu BYE babak awal ⇒ sembunyikan entri2 di earliest round itu.
-     * - Babak selain earliest round TIDAK DISENTUH (tetap muncul meski masih TBD/menunggu pemenang).
+     * - Tentukan earliest round per pool (mis. 1; bisa >1 pada kasus tertentu)
+     * - Untuk setiap (pool_id, battle_group), cek jumlah entri di earliest round pool tsb.
+     * - Jika jumlah entri < 2 ⇒ itu BYE babak awal ⇒ sembunyikan entri di earliest round itu.
+     * - Babak selain earliest round TIDAK DISENTUH.
      */
     $battle = $matches->where('mode', 'battle');
 
@@ -1122,23 +1122,21 @@ class SeniMatchController extends Controller
             ->groupBy('pool_id')
             ->map(fn($col) => (int) $col->min('round'));
 
-        // Kelompokkan per battle_group (abaikan yang battle_group null/kosong)
+        // ✅ Group per POOL + battle_group agar tidak tercampur antar pool
         $groups = $battle
             ->filter(fn($m) => !empty($m->battle_group))
-            ->groupBy('battle_group');
+            ->groupBy(fn($m) => $m->pool_id . '|' . $m->battle_group);
 
         $idsToHide = collect();
 
-        foreach ($groups as $groupMatches) {
-            /** @var \App\Models\SeniMatch $first */
-            $first = $groupMatches->first();
-            $poolId = $first->pool_id ?? null;
-            if (!$poolId) continue;
+        foreach ($groups as $key => $groupMatches) {
+            [$poolIdStr, $bgStr] = explode('|', $key);
+            $poolId = (int) $poolIdStr;
 
             $earliestRound = $minRoundByPool[$poolId] ?? 1;
 
-            // entri babak awal untuk group ini (di pool yg sama)
-            $firstRoundEntries = $groupMatches->filter(fn($m) => (int)$m->round === $earliestRound);
+            // entri babak awal untuk group ini (di pool yang sama)
+            $firstRoundEntries = $groupMatches->filter(fn($m) => (int) $m->round === $earliestRound);
 
             // kalau hanya 1 entri ⇒ ini BYE babak awal ⇒ hide entri babak awal tersebut
             if ($firstRoundEntries->count() < 2) {
@@ -1153,9 +1151,9 @@ class SeniMatchController extends Controller
 
     // Group by age_category + match category + gender (struktur tetap)
     $grouped = $matches->groupBy(fn($match) =>
-        $match->pool->ageCategory->name . '|' .
-        $match->matchCategory->name . '|' .
-        $match->gender
+        ($match->pool->ageCategory->name ?? '-') . '|' .
+        ($match->matchCategory->name ?? '-') . '|' .
+        ($match->gender ?? '-')
     )
     ->map(function ($matchesByGroup, $key) {
         [$ageCategory, $category, $gender] = explode('|', $key);
@@ -1164,7 +1162,7 @@ class SeniMatchController extends Controller
             'age_category' => $ageCategory,
             'category'     => $category,
             'gender'       => $gender,
-            'pools'        => $matchesByGroup->groupBy(fn($match) => $match->pool->name)
+            'pools'        => $matchesByGroup->groupBy(fn($match) => $match->pool->name ?? 'Pool')
                 ->map(function ($poolMatches, $poolName) {
                     return [
                         'name'    => $poolName,
@@ -1176,6 +1174,7 @@ class SeniMatchController extends Controller
 
     return response()->json($grouped);
 }
+
 
 
 
