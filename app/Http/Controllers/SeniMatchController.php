@@ -1584,7 +1584,7 @@ class SeniMatchController extends Controller
      */
     protected function generatePoolMode($validated)
     {
-        // Hapus data lama
+        // Bersih-bersih lama
         $existingPools = \App\Models\SeniPool::where('tournament_id', $validated['tournament_id'])
             ->where('match_category_id', $validated['match_category_id'])
             ->where('age_category_id', $validated['age_category_id'])
@@ -1606,87 +1606,209 @@ class SeniMatchController extends Controller
             })
             ->with('participant')
             ->get()
-            ->filter(fn($tp) => $tp->participant !== null);
+            ->filter(fn($tp) => $tp->participant !== null)
+            ->values();
 
         if ($participants->isEmpty()) {
             return response()->json(['message' => 'No participants found.'], 404);
         }
 
-        // Kelompokkan berdasarkan kontingen untuk Ganda/Regu
-        $matchCategory = $validated['match_category_id'];
-        $requiredMembers = $matchCategory === 3 ? 2 : ($matchCategory === 4 ? 3 : 1);
-        $usedMemberIds = [];
+        // === Konfigurasi dasar
+        $matchCategory = (int) $validated['match_category_id'];
+        $poolSize      = (int) $validated['pool_size'];
+        $gender        = $validated['gender'];
+        $tournamentId  = (int) $validated['tournament_id'];
+        $ageCategoryId = (int) $validated['age_category_id'];
 
-        if ($matchCategory === 2 || $matchCategory === 5) {
-            $units = $participants->shuffle()->values();
+        // Ukuran tim (unit)
+        $teamSize = match ($matchCategory) {
+            3 => 2, // Ganda
+            4 => 3, // Regu
+            default => 1, // Tunggal
+        };
+
+        // Dummy contingents (sama dengan generateBattleMode)
+        $dummyContingents = [310,311,312,313,314,315];
+        if (method_exists($this, 'ensureContingentsExist')) {
+            $this->ensureContingentsExist($dummyContingents, $tournamentId);
+        }
+
+        // === UTIL: bikin 1 unit dummy pakai createDummySeniTeam() lalu ambil anggota terbaru
+        $buildDummyUnit = function (int $teamSize, int $contingentId, $templateMember = null) use ($validated) {
+            // pakai util yang sudah ada
+            $this->createDummySeniTeam($teamSize, $contingentId, $templateMember, $validated);
+
+            // ambil id anggota dummy paling baru untuk kontingen tsb (jumlah = teamSize)
+            $memberIds = DB::table('tournament_participants as tp')
+                ->join('team_members as tm', 'tp.team_member_id', '=', 'tm.id')
+                ->where('tp.tournament_id', $validated['tournament_id'])
+                ->whereNull('tp.pool_id') // baru dibuat, belum di-assign pool
+                ->where('tm.match_category_id', $validated['match_category_id'])
+                ->where('tm.age_category_id',  $validated['age_category_id'])
+                ->where('tm.gender',           $validated['gender'])
+                ->where('tm.contingent_id',    $contingentId)
+                ->orderByDesc('tp.id')
+                ->limit($teamSize)
+                ->pluck('tm.id')
+                ->values();
+
+            return [
+                'contingent_id' => $contingentId,
+                'members'       => $memberIds->all(), // array of tm.id
+            ];
+        };
+
+        // === Bentuk UNIT (tiap unit = 1 slot di pool)
+        // - Tunggal: 1 member (langsung dari daftar)
+        // - Ganda/Regu: chunk per kontingen sebanyak teamSize
+        if ($teamSize === 1) {
+            $units = $participants->shuffle()->values()->map(function ($tp) {
+                return [
+                    'contingent_id' => $tp->participant->contingent_id,
+                    'members'       => [$tp->participant->id],
+                ];
+            });
         } else {
             $units = $participants
                 ->groupBy(fn($tp) => $tp->participant->contingent_id)
-                ->filter(fn($group) => $group->count() >= $requiredMembers)
-                ->map(fn($group) => $group->shuffle()->take($requiredMembers))
-                ->values()
-                ->shuffle();
+                ->map(function ($group) use ($teamSize) {
+                    $members = $group->pluck('participant')->filter()->shuffle()->values();
+                    // pecah jadi tim beranggotakan teamSize (harus full)
+                    return $members->chunk($teamSize)
+                        ->filter(fn($c) => $c->count() === $teamSize)
+                        ->map(fn($c) => [
+                            'contingent_id' => $c->first()->contingent_id,
+                            'members'       => $c->pluck('id')->all(),
+                        ])->values();
+                })
+                ->flatten(1)
+                ->shuffle()
+                ->values();
         }
 
-        // Bagi ke dalam pool
-        $chunks = $units->chunk($validated['pool_size']);
+        if ($units->isEmpty()) {
+            return response()->json(['message' => 'No valid units.'], 422);
+        }
+
+        // === Helper: urutan selang-seling kontingen (greedy)
+        $alternateOrder = function (\Illuminate\Support\Collection $unitList) {
+            $buckets = [];
+            foreach ($unitList as $u) {
+                $cid = $u['contingent_id'] ?? 0;
+                $buckets[$cid] = $buckets[$cid] ?? [];
+                $buckets[$cid][] = $u;
+            }
+            // kontingen terbanyak dulu
+            uasort($buckets, fn($a,$b)=>count($b)<=>count($a));
+
+            $result = [];
+            $lastCid = null;
+            $total = array_sum(array_map('count', $buckets));
+
+            for ($i=0; $i<$total; $i++) {
+                $pickedCid = null;
+                foreach ($buckets as $cid => $arr) {
+                    if (!empty($arr) && $cid !== $lastCid) { $pickedCid = $cid; break; }
+                }
+                if ($pickedCid === null) {
+                    foreach ($buckets as $cid => $arr) {
+                        if (!empty($arr)) { $pickedCid = $cid; break; }
+                    }
+                }
+                if ($pickedCid === null) break;
+
+                $u = array_shift($buckets[$pickedCid]);
+                $result[] = $u;
+                $lastCid = $pickedCid;
+            }
+            return collect($result);
+        };
+
+        // === Bagi menjadi pool (chunk) dan pastikan pool_size=6 → tiap pool 6 unit (top-up dummy)
+        $chunks = $units->chunk($poolSize);
+        $usedMemberIds = [];
 
         foreach ($chunks as $i => $chunk) {
+            // TOP-UP: khusus jika pool_size = 6 (wajib 6 unit per pool)
+            if ($poolSize === 6 && $chunk->count() < 6) {
+                // template buat gender/age/match (pakai peserta pertama pool ini, fallback peserta global pertama)
+                $templateMember = null;
+                if ($chunk->count() > 0) {
+                    $firstMemberId  = $chunk->first()['members'][0] ?? null;
+                    $templateMember = $firstMemberId ? \App\Models\TeamMember::find($firstMemberId) : null;
+                }
+                if (!$templateMember && $participants->count() > 0) {
+                    $templateMember = $participants->first()->participant;
+                }
+
+                while ($chunk->count() < 6) {
+                    $contingentId = $dummyContingents[($i + $chunk->count()) % count($dummyContingents)];
+                    $dummyUnit    = $buildDummyUnit($teamSize, $contingentId, $templateMember);
+
+                    // Simpan sebagai 1 unit (anggota dari satu kontingen dummy yang sama)
+                    if (count($dummyUnit['members']) === $teamSize) {
+                        $chunk->push([
+                            'contingent_id' => $dummyUnit['contingent_id'],
+                            'members'       => $dummyUnit['members'],
+                        ]);
+                    } else {
+                        break; // safety
+                    }
+                }
+            }
+
+            // Atur urutan selang-seling kontingen
+            $ordered = $alternateOrder($chunk->values());
+
+            // Buat pool
             $pool = \App\Models\SeniPool::create([
-                'tournament_id' => $validated['tournament_id'],
-                'match_category_id' => $validated['match_category_id'],
-                'age_category_id' => $validated['age_category_id'],
-                'gender' => $validated['gender'],
-                'name' => 'Pool ' . ($i + 1),
+                'tournament_id'     => $tournamentId,
+                'match_category_id' => $matchCategory,
+                'age_category_id'   => $ageCategoryId,
+                'gender'            => $gender,
+                'name'              => 'Pool ' . ($i + 1),
+                'mode'              => 'pool',
             ]);
 
-            foreach ($chunk->values() as $index => $unit) {
-                if ($matchCategory === 2 || $matchCategory === 5) {
-                    $teamMember = $unit->participant;
-                    if (in_array($teamMember->id, $usedMemberIds)) continue;
+            // Assign semua anggota unit di pool ini ke tp.pool_id = pool.id (termasuk dummy yang baru dibuat)
+            $memberIdsInPool = $ordered->flatMap(fn($u) => $u['members'])->unique()->values();
+            if ($memberIdsInPool->isNotEmpty()) {
+                \App\Models\TournamentParticipant::whereIn('team_member_id', $memberIdsInPool->all())
+                    ->where('tournament_id', $tournamentId)
+                    ->update(['pool_id' => $pool->id]);
+            }
 
-                    \App\Models\SeniMatch::create([
-                        'pool_id' => $pool->id,
-                        'match_order' => $index + 1,
-                        'gender' => $validated['gender'],
-                        'match_category_id' => $matchCategory,
-                        'match_type' => 'seni_tunggal',
-                        'contingent_id' => $teamMember->contingent_id,
-                        'team_member_1' => $teamMember->id,
-                    ]);
-                    $usedMemberIds[] = $teamMember->id;
+            // Insert match (urutan sudah diselang-seling)
+            foreach ($ordered->values() as $idx => $unit) {
+                $memberIds = collect($unit['members'])->values();
 
-                } else {
-                    $members = $unit->pluck('participant')->filter()->values();
-                    $memberIds = $members->pluck('id');
+                // hindari double-pakai member
+                if ($memberIds->intersect($usedMemberIds)->isNotEmpty()) continue;
 
-                    if ($memberIds->count() < $requiredMembers) continue;
-                    if ($memberIds->intersect($usedMemberIds)->isNotEmpty()) continue;
+                $data = [
+                    'pool_id'           => $pool->id,
+                    'match_order'       => $idx + 1,
+                    'gender'            => $gender,
+                    'match_category_id' => $matchCategory,
+                    'match_type'        => match ($matchCategory) {
+                        3 => 'seni_ganda',
+                        4 => 'seni_regu',
+                        default => 'seni_tunggal',
+                    },
+                    'contingent_id'     => $unit['contingent_id'],
+                    'team_member_1'     => $memberIds[0] ?? null,
+                    'team_member_2'     => $teamSize >= 2 ? ($memberIds[1] ?? null) : null,
+                    'team_member_3'     => $teamSize >= 3 ? ($memberIds[2] ?? null) : null,
+                ];
 
-                    $matchData = [
-                        'pool_id' => $pool->id,
-                        'match_order' => $index + 1,
-                        'gender' => $validated['gender'],
-                        'match_category_id' => $matchCategory,
-                        'match_type' => match ($matchCategory) {
-                            3 => 'seni_ganda',
-                            4 => 'seni_regu',
-                        },
-                        'contingent_id' => $members[0]->contingent_id,
-                        'team_member_1' => $memberIds[0],
-                    ];
-
-                    if ($requiredMembers >= 2) $matchData['team_member_2'] = $memberIds[1];
-                    if ($requiredMembers === 3) $matchData['team_member_3'] = $memberIds[2];
-
-                    \App\Models\SeniMatch::create($matchData);
-                    $usedMemberIds = array_merge($usedMemberIds, $memberIds->toArray());
-                }
+                \App\Models\SeniMatch::create($data);
+                $usedMemberIds = array_merge($usedMemberIds, $memberIds->all());
             }
         }
 
-        return response()->json(['message' => 'Seni matches created (pool mode) successfully.']);
+        return response()->json(['message' => 'Seni matches created (pool mode) successfully (size=6: dummy top-up + kontingen selang-seling).']);
     }
+
 
     private function getRoundLabel(int $round, int $maxRound): string
     {
