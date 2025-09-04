@@ -360,351 +360,381 @@ class TournamentMatchController extends Controller
     }
 
    private function generateBracketForSix($poolId, $participants = null)
-    {
-        return DB::transaction(function () use ($poolId, $participants) {
-            TournamentMatch::where('pool_id', $poolId)->delete();
+{
+    return DB::transaction(function () use ($poolId, $participants) {
+        TournamentMatch::where('pool_id', $poolId)->delete();
 
-            $pool = Pool::with('tournament')->find($poolId);
-            if (!$pool) {
-                return response()->json(['message' => 'Pool tidak ditemukan.'], 404);
+        $pool = Pool::with('tournament')->find($poolId);
+        if (!$pool) {
+            return response()->json(['message' => 'Pool tidak ditemukan.'], 404);
+        }
+
+        // --- Normalisasi input participants (boleh Collection/array/null) ---
+        $toCollection = function ($items) {
+            if ($items instanceof \Illuminate\Support\Collection) return $items->values();
+            if (is_array($items)) return collect($items)->values();
+            return collect();
+        };
+        $participants = $toCollection($participants);
+
+        // Ambil ID dari berbagai bentuk (Model/stdClass/array)
+        $getId = function ($row) {
+            if (is_object($row)) {
+                if (isset($row->id)) return $row->id;
+                if (method_exists($row, 'getAttribute')) return $row->getAttribute('id');
             }
+            if (is_array($row) && array_key_exists('id', $row)) return $row['id'];
+            return null;
+        };
 
-            // --- Normalisasi input participants (boleh Collection/array/null) ---
-            $toCollection = function ($items) {
-                if ($items instanceof \Illuminate\Support\Collection) return $items->values();
-                if (is_array($items)) return collect($items)->values();
-                return collect();
-            };
-            $participants = $toCollection($participants);
+        // ============== Ambil kandidat (maks 6) ==============
+        if ($participants->count() > 0) {
+            // IDs unik dari input
+            $selectedIds = $participants->map($getId)->filter()->unique()->take(6)->values();
+        } else {
+            // Cari dari peserta turnamen (belum punya pool / sudah di pool ini)
+            $selectedIds = TeamMember::query()
+                ->select('team_members.id')
+                ->join('tournament_participants as tp', 'tp.team_member_id', '=', 'team_members.id')
+                ->where('tp.tournament_id', $pool->tournament_id)
+                ->where(function ($q) use ($pool) {
+                    $q->whereNull('tp.pool_id')->orWhere('tp.pool_id', $pool->id);
+                })
+                ->where('team_members.category_class_id', $pool->category_class_id)
+                ->where('team_members.match_category_id', $pool->match_category_id)
+                ->distinct()
+                ->take(6)
+                ->pluck('team_members.id');
+        }
 
-            // Ambil ID dari berbagai bentuk (Model/stdClass/array)
-            $getId = function ($row) {
-                if (is_object($row)) {
-                    if (isset($row->id)) return $row->id;
-                    if (method_exists($row, 'getAttribute')) return $row->getAttribute('id');
-                }
-                if (is_array($row) && array_key_exists('id', $row)) return $row['id'];
-                return null;
-            };
+        // ============== FILTER: jangan yang sudah di pool lain ==============
+        $alreadyElsewhere = DB::table('tournament_participants as tp')
+            ->where('tp.tournament_id', $pool->tournament_id)
+            ->whereIn('tp.team_member_id', $selectedIds->all())
+            ->whereNotNull('tp.pool_id')
+            ->where('tp.pool_id', '!=', $poolId)
+            ->pluck('tp.pool_id', 'tp.team_member_id'); // [team_member_id => pool_id]
 
-            // Kalau caller kasih participants → pakai itu; kalau tidak, ambil kandidat dari turnamen sesuai kelas/kategori (maks 6)
-            if ($participants->count() > 0) {
-                $selectedIds = $participants->map($getId)->filter()->take(6)->values();
-            } else {
-                $selectedIds = TeamMember::query()
-                    ->select('team_members.id')
-                    ->join('tournament_participants as tp', 'tp.team_member_id', '=', 'team_members.id')
-                    ->where('tp.tournament_id', $pool->tournament_id)
-                    ->where(function ($q) use ($pool) {
-                        $q->whereNull('tp.pool_id')->orWhere('tp.pool_id', $pool->id);
-                    })
-                    ->where('team_members.category_class_id', $pool->category_class_id)
-                    ->where('team_members.match_category_id', $pool->match_category_id)
-                    ->take(6)
-                    ->pluck('id');
-            }
-
-            // Assign semua yang kepilih ke pool ini (kalau sudah terdaftar di tournament)
-            if ($selectedIds->isNotEmpty()) {
-                TournamentParticipant::whereIn('team_member_id', $selectedIds->all())
-                    ->where('tournament_id', $pool->tournament_id)
-                    ->update(['pool_id' => $poolId]);
-            }
-
-            // === Util bikin dummy konsisten dengan Full Prestasi ===
-            $dummyContingentPool = [310, 311, 312, 313, 314, 315];
-
-            $makeDummyFor = function ($templateTmId, $gender = null) use ($pool, $dummyContingentPool) {
-                if (method_exists($this, 'ensureContingentsExist')) {
-                    $this->ensureContingentsExist($dummyContingentPool, $pool->tournament_id);
-                }
-
-                $template = TeamMember::find($templateTmId);
-                if (!$template) {
-                    $template = TeamMember::query()
-                        ->where('category_class_id', $pool->category_class_id)
-                        ->where('match_category_id', $pool->match_category_id)
-                        ->when(Schema::hasColumn('team_members', 'gender') && $gender, fn($q) => $q->where('gender', $gender))
-                        ->first();
-                }
-                $chosenContingent = $dummyContingentPool[array_rand($dummyContingentPool)];
-
-                if (method_exists($this, 'createDummyTeamMemberAndRegister')) {
-                    $this->createDummyTeamMemberAndRegister(
-                        $template,
-                        $chosenContingent,
-                        Schema::hasColumn('team_members', 'gender') ? ($gender ?? $template->gender) : null,
-                        $pool->tournament_id,
-                        $pool->id,
-                        [
-                            'match_category_id' => $pool->match_category_id,
-                            'category_class_id' => $pool->category_class_id,
-                        ]
-                    );
-
-                    $dummyId = DB::table('tournament_participants as tp')
-                        ->join('team_members as tm', 'tp.team_member_id', '=', 'tm.id')
-                        ->where('tp.tournament_id', $pool->tournament_id)
-                        ->where('tp.pool_id', $pool->id)
-                        ->where('tm.category_class_id', $pool->category_class_id)
-                        ->where('tm.match_category_id', $pool->match_category_id)
-                        ->where('tm.contingent_id', $chosenContingent)
-                        ->orderByDesc('tp.id')
-                        ->value('tm.id');
-
-                    return $dummyId;
-                }
-
-                // fallback inline (kalau helper nggak ada)
-                $dummyName   = 'Dummy ' . ($template?->name ? '(' . $template->name . ')' : strtoupper(uniqid()));
-                $dummyGender = Schema::hasColumn('team_members', 'gender') ? ($gender ?? $template?->gender ?? 'male') : null;
-
-                $dummyTmId = DB::table('team_members')->insertGetId(array_filter([
-                    'name'                     => $dummyName,
-                    'contingent_id'            => $chosenContingent,
-                    'gender'                   => $dummyGender,
-                    'championship_category_id' => $template?->championship_category_id,
-                    'age_category_id'          => $pool->age_category_id ?? $template?->age_category_id,
-                    'category_class_id'        => $pool->category_class_id,
-                    'match_category_id'        => $pool->match_category_id,
-                    'is_dummy'                 => Schema::hasColumn('team_members','is_dummy') ? 1 : null,
-                    'created_at'               => now(),
-                    'updated_at'               => now(),
-                ]));
-
-                DB::table('tournament_participants')->insert([
-                    'tournament_id'  => $pool->tournament_id,
-                    'team_member_id' => $dummyTmId,
-                    'pool_id'        => $pool->id,
-                    'created_at'     => now(),
-                    'updated_at'     => now(),
-                ]);
-
-                return $dummyTmId;
-            };
-
-            // === TOP-UP: kalau peserta < 6 → tambah dummy sampai 6 ===
-            $tplId = $selectedIds->first() ?: TeamMember::query()
-                ->where('category_class_id', $pool->category_class_id)
-                ->where('match_category_id', $pool->match_category_id)
-                ->value('id');
-
-            $tplGender = optional(TeamMember::find($tplId))->gender;
-
-            while ($selectedIds->count() < 6) {
-                $dummyId = $makeDummyFor($tplId, $tplGender);
-                if (!$dummyId) break;
-                $selectedIds->push($dummyId)->values();
-                TournamentParticipant::where('team_member_id', $dummyId)
-                    ->where('tournament_id', $pool->tournament_id)
-                    ->update(['pool_id' => $poolId]);
-            }
-
-            // SAFETY
-            if ($selectedIds->count() < 2) {
-                return response()->json(['message' => 'Tidak cukup peserta untuk bagan 6.'], 400);
-            }
-
-            // ====================== Build bracket 6 peserta (8 slot) ======================
-            $ids = $selectedIds->all();
-
-            $bracketSize = 8;      // R1: 4 match
-            $maxRound    = 3;      // QF, SF, Final
-            $roundCount  = [1 => 4, 2 => 2, 3 => 1];
-
-            $matches = [];
-            $matchNo = 1;
-            for ($r = 1; $r <= $maxRound; $r++) {
-                for ($i = 0; $i < $roundCount[$r]; $i++) {
-                    $matches[] = [
-                        'pool_id'              => $poolId,
-                        'round'                => $r,
-                        'round_label'          => $this->getRoundLabel($r, $maxRound),
-                        'match_number'         => $matchNo++,
-                        'participant_1'        => null,
-                        'participant_2'        => null,
-                        'winner_id'            => null,
-                        'next_match_id'        => null,
-                        'parent_match_red_id'  => null,
-                        'parent_match_blue_id' => null,
-                        'created_at'           => now(),
-                        'updated_at'           => now(),
-                    ];
-                }
-            }
-            $firstRoundIdx = array_keys(array_filter($matches, fn($m) => $m['round'] === 1)); // 4 index
-
-            // --- Meta peserta & flag dummy ---
-            $isDummyCol = Schema::hasColumn('team_members', 'is_dummy');
-            $tmMeta = DB::table('team_members')
-                ->whereIn('id', $ids)
-                ->select(array_filter(['id','contingent_id',$isDummyCol ? 'is_dummy' : null]))
-                ->get()->keyBy('id');
-            $dummyContingentIds = [310, 311, 312, 313, 314, 315];
-
-            $isDummy = function ($id) use ($tmMeta, $isDummyCol, $dummyContingentIds) {
-                $tm = $tmMeta[$id] ?? null;
-                if (!$tm) return false;
-                if ($isDummyCol) return (bool) $tm->is_dummy;
-                return in_array($tm->contingent_id, $dummyContingentIds, true);
-            };
-
-            $reals   = array_values(array_filter($ids, fn($id) => !$isDummy($id)));
-            $dummies = array_values(array_filter($ids, fn($id) =>  $isDummy($id)));
-
-            // --- Pairing helper: prefer beda kontingen ---
-            $pickPartner = function ($candidateId, array &$pool, $preferDifferentContingent = true) use ($tmMeta) {
-                $cid = $tmMeta[$candidateId]->contingent_id ?? null;
-                if ($preferDifferentContingent) {
-                    foreach ($pool as $k => $pid) {
-                        if (($tmMeta[$pid]->contingent_id ?? null) !== $cid) {
-                            $partner = $pid;
-                            unset($pool[$k]);
-                            $pool = array_values($pool);
-                            return $partner;
-                        }
-                    }
-                }
-                if (!empty($pool)) {
-                    $partner = array_shift($pool);
-                    return $partner;
-                }
-                return null;
-            };
-
-            // Kita butuh 2 match di QF yang benar-benar dimainkan; 2 slot lain jadi BYE
-            $neededPairs = 2;
-            $pairings = [];
-            $used = [];
-
-            // Urutan prioritas: Real vs Dummy → Real vs Real → Dummy vs Dummy
-            while (count($pairings) < $neededPairs) {
-                $p1 = null; $p2 = null;
-
-                if (!empty($reals) && !empty($dummies)) {
-                    $p1 = array_shift($reals);
-                    $p2 = $pickPartner($p1, $dummies, true);
-                    if (!$p2) { array_unshift($reals, $p1); $p1 = $p2 = null; }
-                }
-                if ((!$p1 || !$p2) && count($reals) >= 2) {
-                    $p1 = array_shift($reals);
-                    $p2 = $pickPartner($p1, $reals, true);
-                }
-                if ((!$p1 || !$p2) && count($dummies) >= 2) {
-                    $p1 = array_shift($dummies);
-                    $p2 = $pickPartner($p1, $dummies, true);
-                }
-
-                if ($p1 && $p2) {
-                    $pairings[] = [$p1, $p2];
-                    $used[] = $p1; $used[] = $p2;
-                } else {
-                    break;
-                }
-            }
-
-            // Isi 2 match pertama Round 1
-            for ($j = 0; $j < $neededPairs; $j++) {
-                $idx  = $firstRoundIdx[$j];
-                $pair = $pairings[$j] ?? [null, null];
-                $matches[$idx]['participant_1'] = $pair[0];
-                $matches[$idx]['participant_2'] = $pair[1];
-            }
-
-            // BYE untuk 2 slot sisa → prioritas Real; tetap dicatat di R1 (slot + winner_id)
-            $remaining = array_values(array_diff($ids, $used));
-            usort($remaining, function ($a, $b) use ($isDummy) {
-                return ($isDummy($a) <=> $isDummy($b)); // real dulu
-            });
-            $byeTargets = array_slice($firstRoundIdx, $neededPairs); // 2 slot terakhir
-            foreach ($byeTargets as $idx) {
-                $id = array_shift($remaining);
-                if (!$id) break;
-                $matches[$idx]['participant_1'] = $id;
-                $matches[$idx]['winner_id']     = $id;
-            }
-
-            // === Seeding: kalau real tepat 2 → letakkan di match #1 & #4 (ujung bracket) supaya ketemu di final ===
-            $allReals = array_values(array_filter($ids, fn($id) => !$isDummy($id)));
-            if (count($allReals) === 2 && count($firstRoundIdx) === 4) {
-                $firstIdx = $firstRoundIdx[0];
-                $lastIdx  = $firstRoundIdx[3];
-
-                $locate = function ($pid) use ($matches, $firstRoundIdx) {
-                    foreach ($firstRoundIdx as $idx) {
-                        if ($matches[$idx]['participant_1'] === $pid) return [$idx, 'participant_1'];
-                        if ($matches[$idx]['participant_2'] === $pid) return [$idx, 'participant_2'];
-                    }
-                    return [null, null];
-                };
-                $recomputeWinner = function (&$m) {
-                    $p1 = $m['participant_1']; $p2 = $m['participant_2'];
-                    $m['winner_id'] = null;
-                    if ($p1 && !$p2) $m['winner_id'] = $p1;
-                    if ($p2 && !$p1) $m['winner_id'] = $p2;
-                };
-                $moveTo = function ($pid, $targetIdx, $targetSlot) use (&$matches, $locate, $recomputeWinner) {
-                    [$curIdx, $curSlot] = $locate($pid);
-                    if ($curIdx === $targetIdx && $curSlot === $targetSlot) return;
-                    $other = $matches[$targetIdx][$targetSlot] ?? null;
-                    $matches[$targetIdx][$targetSlot] = $pid;
-                    if ($curIdx !== null) {
-                        $matches[$curIdx][$curSlot] = $other;
-                        $recomputeWinner($matches[$curIdx]);
-                    }
-                    $recomputeWinner($matches[$targetIdx]);
-                };
-
-                $moveTo($allReals[0], $firstIdx, 'participant_1'); // match #1
-                $moveTo($allReals[1], $lastIdx,  'participant_1'); // match #4
-            }
-
-            // Insert semua match
-            DB::table('tournament_matches')->insert($matches);
-
-            // Link parent-child + propagate winner BYE
-            $matchMap    = TournamentMatch::where('pool_id', $poolId)->orderBy('match_number')->get();
-            $roundGroups = $matchMap->groupBy('round');
-
-            foreach ($roundGroups as $round => $matchesInRound) {
-                if ($round >= $maxRound) continue;
-
-                $nextRoundIndexed = ($roundGroups[$round + 1] ?? collect())->values();
-
-                foreach ($matchesInRound->values() as $i => $match) {
-                    $targetIndex = (int) floor($i / 2);
-                    $nextMatch   = $nextRoundIndexed->get($targetIndex);
-                    if (!$nextMatch) continue;
-
-                    $match->next_match_id = $nextMatch->id;
-                    $match->save();
-
-                    if ($i % 2 === 0) {
-                        TournamentMatch::where('id', $nextMatch->id)->update(['parent_match_blue_id' => $match->id]);
-                    } else {
-                        TournamentMatch::where('id', $nextMatch->id)->update(['parent_match_red_id' => $match->id]);
-                    }
-
-                    if ($match->winner_id) {
-                        if (is_null($nextMatch->participant_1)) {
-                            $nextMatch->participant_1 = $match->winner_id;
-                        } elseif (is_null($nextMatch->participant_2)) {
-                            $nextMatch->participant_2 = $match->winner_id;
-                        }
-                        $nextMatch->save();
-                    }
-                }
-            }
-
-            $inserted = TournamentMatch::where('pool_id', $poolId)
-                ->orderBy('round')->orderBy('match_number')->get();
-
-            return response()->json([
-                'message' => 'Bagan 6 dibuat: peserta < 6 di-top-up dummy → 6 total. Pairing anti dummy vs dummy, BYE prioritas real, dan 2 real (jika hanya 2) disebar di ujung supaya ketemu di final.',
-                'rounds'  => $inserted,
+        if ($alreadyElsewhere->isNotEmpty()) {
+            \Log::info('🧹 Filter peserta yang sudah ada di pool lain', [
+                'pool_now' => $poolId,
+                'blocked'  => $alreadyElsewhere->toArray(),
             ]);
+        }
+
+        // buang yang sudah terdaftar di pool lain
+        $selectedIds = $selectedIds->reject(fn ($id) => $alreadyElsewhere->has($id))->values();
+
+        // Assign semua yang kepilih ke pool ini, TAPI:
+        // hanya update baris yang pool_id NULL atau SUDAH = pool ini (anti "nyolong" dari pool lain)
+        if ($selectedIds->isNotEmpty()) {
+            TournamentParticipant::whereIn('team_member_id', $selectedIds->all())
+                ->where('tournament_id', $pool->tournament_id)
+                ->where(function ($q) use ($poolId) {
+                    $q->whereNull('pool_id')->orWhere('pool_id', $poolId);
+                })
+                ->update(['pool_id' => $poolId]);
+        }
+
+        // === Util bikin dummy konsisten dengan Full Prestasi ===
+        $dummyContingentPool = [310, 311, 312, 313, 314, 315];
+
+        $makeDummyFor = function ($templateTmId, $gender = null) use ($pool, $dummyContingentPool) {
+            if (method_exists($this, 'ensureContingentsExist')) {
+                $this->ensureContingentsExist($dummyContingentPool, $pool->tournament_id);
+            }
+
+            $template = TeamMember::find($templateTmId);
+            if (!$template) {
+                $template = TeamMember::query()
+                    ->where('category_class_id', $pool->category_class_id)
+                    ->where('match_category_id', $pool->match_category_id)
+                    ->when(Schema::hasColumn('team_members', 'gender') && $gender, fn($q) => $q->where('gender', $gender))
+                    ->first();
+            }
+            $chosenContingent = $dummyContingentPool[array_rand($dummyContingentPool)];
+
+            if (method_exists($this, 'createDummyTeamMemberAndRegister')) {
+                $this->createDummyTeamMemberAndRegister(
+                    $template,
+                    $chosenContingent,
+                    Schema::hasColumn('team_members', 'gender') ? ($gender ?? $template->gender) : null,
+                    $pool->tournament_id,
+                    $pool->id,
+                    [
+                        'match_category_id' => $pool->match_category_id,
+                        'category_class_id' => $pool->category_class_id,
+                    ]
+                );
+
+                $dummyId = DB::table('tournament_participants as tp')
+                    ->join('team_members as tm', 'tp.team_member_id', '=', 'tm.id')
+                    ->where('tp.tournament_id', $pool->tournament_id)
+                    ->where('tp.pool_id', $pool->id)
+                    ->where('tm.category_class_id', $pool->category_class_id)
+                    ->where('tm.match_category_id', $pool->match_category_id)
+                    ->where('tm.contingent_id', $chosenContingent)
+                    ->orderByDesc('tp.id')
+                    ->value('tm.id');
+
+                return $dummyId;
+            }
+
+            // fallback inline (kalau helper nggak ada)
+            $dummyName   = 'Dummy ' . ($template?->name ? '(' . $template->name . ')' : strtoupper(uniqid()));
+            $dummyGender = Schema::hasColumn('team_members', 'gender') ? ($gender ?? $template?->gender ?? 'male') : null;
+
+            $dummyTmId = DB::table('team_members')->insertGetId(array_filter([
+                'name'                     => $dummyName,
+                'contingent_id'            => $chosenContingent,
+                'gender'                   => $dummyGender,
+                'championship_category_id' => $template?->championship_category_id,
+                'age_category_id'          => $pool->age_category_id ?? $template?->age_category_id,
+                'category_class_id'        => $pool->category_class_id,
+                'match_category_id'        => $pool->match_category_id,
+                'is_dummy'                 => Schema::hasColumn('team_members','is_dummy') ? 1 : null,
+                'created_at'               => now(),
+                'updated_at'               => now(),
+            ]));
+
+            DB::table('tournament_participants')->insert([
+                'tournament_id'  => $pool->tournament_id,
+                'team_member_id' => $dummyTmId,
+                'pool_id'        => $pool->id,
+                'created_at'     => now(),
+                'updated_at'     => now(),
+            ]);
+
+            return $dummyTmId;
+        };
+
+        // === TOP-UP: kalau peserta < 6 → tambah dummy sampai 6 ===
+        $tplId = $selectedIds->first() ?: TeamMember::query()
+            ->where('category_class_id', $pool->category_class_id)
+            ->where('match_category_id', $pool->match_category_id)
+            ->value('id');
+
+        $tplGender = optional(TeamMember::find($tplId))->gender;
+
+        while ($selectedIds->count() < 6) {
+            $dummyId = $makeDummyFor($tplId, $tplGender);
+            if (!$dummyId) break;
+            $selectedIds->push($dummyId)->values();
+            TournamentParticipant::where('team_member_id', $dummyId)
+                ->where('tournament_id', $pool->tournament_id)
+                ->where(function ($q) use ($poolId) {
+                    $q->whereNull('pool_id')->orWhere('pool_id', $poolId);
+                })
+                ->update(['pool_id' => $poolId]);
+        }
+
+        // SAFETY
+        if ($selectedIds->count() < 2) {
+            return response()->json(['message' => 'Tidak cukup peserta untuk bagan 6.'], 400);
+        }
+
+        // ====================== Build bracket 6 peserta (8 slot) ======================
+        $ids = $selectedIds->all();
+
+        $bracketSize = 8;      // R1: 4 match
+        $maxRound    = 3;      // QF, SF, Final
+        $roundCount  = [1 => 4, 2 => 2, 3 => 1];
+
+        $matches = [];
+        $matchNo = 1;
+        for ($r = 1; $r <= $maxRound; $r++) {
+            for ($i = 0; $i < $roundCount[$r]; $i++) {
+                $matches[] = [
+                    'pool_id'              => $poolId,
+                    'round'                => $r,
+                    'round_label'          => $this->getRoundLabel($r, $maxRound),
+                    'match_number'         => $matchNo++,
+                    'participant_1'        => null,
+                    'participant_2'        => null,
+                    'winner_id'            => null,
+                    'next_match_id'        => null,
+                    'parent_match_red_id'  => null,
+                    'parent_match_blue_id' => null,
+                    'created_at'           => now(),
+                    'updated_at'           => now(),
+                ];
+            }
+        }
+        $firstRoundIdx = array_keys(array_filter($matches, fn($m) => $m['round'] === 1)); // 4 index
+
+        // --- Meta peserta & flag dummy ---
+        $isDummyCol = Schema::hasColumn('team_members', 'is_dummy');
+        $tmMeta = DB::table('team_members')
+            ->whereIn('id', $ids)
+            ->select(array_filter(['id','contingent_id',$isDummyCol ? 'is_dummy' : null]))
+            ->get()->keyBy('id');
+        $dummyContingentIds = [310, 311, 312, 313, 314, 315];
+
+        $isDummy = function ($id) use ($tmMeta, $isDummyCol, $dummyContingentIds) {
+            $tm = $tmMeta[$id] ?? null;
+            if (!$tm) return false;
+            if ($isDummyCol) return (bool) $tm->is_dummy;
+            return in_array($tm->contingent_id, $dummyContingentIds, true);
+        };
+
+        $reals   = array_values(array_filter($ids, fn($id) => !$isDummy($id)));
+        $dummies = array_values(array_filter($ids, fn($id) =>  $isDummy($id)));
+
+        // --- Pairing helper: prefer beda kontingen ---
+        $pickPartner = function ($candidateId, array &$poolArr, $preferDifferentContingent = true) use ($tmMeta) {
+            $cid = $tmMeta[$candidateId]->contingent_id ?? null;
+            if ($preferDifferentContingent) {
+                foreach ($poolArr as $k => $pid) {
+                    if (($tmMeta[$pid]->contingent_id ?? null) !== $cid) {
+                        $partner = $pid;
+                        unset($poolArr[$k]);
+                        $poolArr = array_values($poolArr);
+                        return $partner;
+                    }
+                }
+            }
+            if (!empty($poolArr)) {
+                $partner = array_shift($poolArr);
+                return $partner;
+            }
+            return null;
+        };
+
+        // Kita butuh 2 match di QF yang benar-benar dimainkan; 2 slot lain jadi BYE
+        $neededPairs = 2;
+        $pairings = [];
+        $used = [];
+
+        // Urutan prioritas: Real vs Dummy → Real vs Real → Dummy vs Dummy
+        while (count($pairings) < $neededPairs) {
+            $p1 = null; $p2 = null;
+
+            if (!empty($reals) && !empty($dummies)) {
+                $p1 = array_shift($reals);
+                $p2 = $pickPartner($p1, $dummies, true);
+                if (!$p2) { array_unshift($reals, $p1); $p1 = $p2 = null; }
+            }
+            if ((!$p1 || !$p2) && count($reals) >= 2) {
+                $p1 = array_shift($reals);
+                $p2 = $pickPartner($p1, $reals, true);
+            }
+            if ((!$p1 || !$p2) && count($dummies) >= 2) {
+                $p1 = array_shift($dummies);
+                $p2 = $pickPartner($p1, $dummies, true);
+            }
+
+            if ($p1 && $p2) {
+                $pairings[] = [$p1, $p2];
+                $used[] = $p1; $used[] = $p2;
+            } else {
+                break;
+            }
+        }
+
+        // Isi 2 match pertama Round 1
+        for ($j = 0; $j < $neededPairs; $j++) {
+            $idx  = $firstRoundIdx[$j];
+            $pair = $pairings[$j] ?? [null, null];
+            $matches[$idx]['participant_1'] = $pair[0];
+            $matches[$idx]['participant_2'] = $pair[1];
+        }
+
+        // BYE untuk 2 slot sisa → prioritas Real; tetap dicatat di R1 (slot + winner_id)
+        $remaining = array_values(array_diff($ids, $used));
+        usort($remaining, function ($a, $b) use ($isDummy) {
+            return ($isDummy($a) <=> $isDummy($b)); // real dulu
         });
-    }
+        $byeTargets = array_slice($firstRoundIdx, $neededPairs); // 2 slot terakhir
+        foreach ($byeTargets as $idx) {
+            $id = array_shift($remaining);
+            if (!$id) break;
+            $matches[$idx]['participant_1'] = $id;
+            $matches[$idx]['winner_id']     = $id;
+        }
+
+        // === Seeding khusus: kalau real tepat 2 → letakkan di ujung supaya ketemu di final ===
+        $allReals = array_values(array_filter($ids, fn($id) => !$isDummy($id)));
+        if (count($allReals) === 2 && count($firstRoundIdx) === 4) {
+            $firstIdx = $firstRoundIdx[0];
+            $lastIdx  = $firstRoundIdx[3];
+
+            $locate = function ($pid) use ($matches, $firstRoundIdx) {
+                foreach ($firstRoundIdx as $ix) {
+                    if ($matches[$ix]['participant_1'] === $pid) return [$ix, 'participant_1'];
+                    if ($matches[$ix]['participant_2'] === $pid) return [$ix, 'participant_2'];
+                }
+                return [null, null];
+            };
+            $recomputeWinner = function (&$m) {
+                $p1 = $m['participant_1']; $p2 = $m['participant_2'];
+                $m['winner_id'] = null;
+                if ($p1 && !$p2) $m['winner_id'] = $p1;
+                if ($p2 && !$p1) $m['winner_id'] = $p2;
+            };
+            $moveTo = function ($pid, $targetIdx, $targetSlot) use (&$matches, $locate, $recomputeWinner) {
+                [$curIdx, $curSlot] = $locate($pid);
+                if ($curIdx === $targetIdx && $curSlot === $targetSlot) return;
+                $other = $matches[$targetIdx][$targetSlot] ?? null;
+                $matches[$targetIdx][$targetSlot] = $pid;
+                if ($curIdx !== null) {
+                    $matches[$curIdx][$curSlot] = $other;
+                    $recomputeWinner($matches[$curIdx]);
+                }
+                $recomputeWinner($matches[$targetIdx]);
+            };
+
+            $moveTo($allReals[0], $firstIdx, 'participant_1'); // match #1
+            $moveTo($allReals[1], $lastIdx,  'participant_1'); // match #4
+        }
+
+        // Insert semua match
+        DB::table('tournament_matches')->insert($matches);
+
+        // Link parent-child + propagate winner BYE
+        $matchMap    = TournamentMatch::where('pool_id', $poolId)->orderBy('match_number')->get();
+        $roundGroups = $matchMap->groupBy('round');
+
+        foreach ($roundGroups as $round => $matchesInRound) {
+            if ($round >= $maxRound) continue;
+
+            $nextRoundIndexed = ($roundGroups[$round + 1] ?? collect())->values();
+
+            foreach ($matchesInRound->values() as $i => $match) {
+                $targetIndex = (int) floor($i / 2);
+                $nextMatch   = $nextRoundIndexed->get($targetIndex);
+                if (!$nextMatch) continue;
+
+                $match->next_match_id = $nextMatch->id;
+                $match->save();
+
+                if ($i % 2 === 0) {
+                    TournamentMatch::where('id', $nextMatch->id)->update(['parent_match_blue_id' => $match->id]);
+                } else {
+                    TournamentMatch::where('id', $nextMatch->id)->update(['parent_match_red_id' => $match->id]);
+                }
+
+                if ($match->winner_id) {
+                    if (is_null($nextMatch->participant_1)) {
+                        $nextMatch->participant_1 = $match->winner_id;
+                    } elseif (is_null($nextMatch->participant_2)) {
+                        $nextMatch->participant_2 = $match->winner_id;
+                    }
+                    $nextMatch->save();
+                }
+            }
+        }
+
+        $inserted = TournamentMatch::where('pool_id', $poolId)
+            ->orderBy('round')->orderBy('match_number')->get();
+
+        return response()->json([
+            'message'  => 'Bagan 6 dibuat. Peserta yang sudah ada di pool lain otomatis di-skip, kekurangan diisi dummy.',
+            'rounds'   => $inserted,
+            'skipped_already_in_other_pool' => $alreadyElsewhere->keys()->values(), // info buat UI/log
+        ]);
+    });
+}
+
 
 
 
