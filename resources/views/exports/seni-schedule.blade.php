@@ -67,34 +67,49 @@
                     <td class="uppercase">{{ $row['class_label'] ?? '-' }}</td>
 
                     {{-- BLUE --}}
-                    <td class="blue-corner" style="width: 25%;">
-                        @php $bn = $row['blue']['names'] ?? null; $bc = $row['blue']['contingent'] ?? null; @endphp
-                        @if($bn)
-                            <div class="names">{{ $bn }}</div>
-                        @elseif(!empty($row['source_blue_order']))
-                            Pemenang Partai #{{ $row['source_blue_order'] }}
-                        @else
-                            -
-                        @endif
-                        @if($bc)
-                            <div class="contingent">{{ $bc }}</div>
-                        @endif
-                    </td>
+<td class="blue-corner" style="width: 25%;">
+    @php
+        $bn = $row['blue']['names'] ?? null;
+        $bc = $row['blue']['contingent'] ?? null;
+    @endphp
 
-                    {{-- RED --}}
-                    <td class="red-corner" style="width: 25%;">
-                        @php $rn = $row['red']['names'] ?? null; $rc = $row['red']['contingent'] ?? null; @endphp
-                        @if($rn)
-                            <div class="names">{{ $rn }}</div>
-                        @elseif(!empty($row['source_red_order']))
-                            Pemenang Partai #{{ $row['source_red_order'] }}
-                        @else
-                            -
-                        @endif
-                        @if($rc)
-                            <div class="contingent">{{ $rc }}</div>
-                        @endif
-                    </td>
+    @if($bn)
+        <div class="names">{{ $bn }}</div>
+    @elseif(!empty($row['source_blue_text']))
+        <div class="names">{{ $row['source_blue_text'] }}</div>
+    @elseif(!empty($row['source_blue_order']))
+        <div class="names">Pemenang Partai #{{ $row['source_blue_order'] }}</div>
+    @else
+        <div class="names">-</div>
+    @endif
+
+    @if($bc)
+        <div class="contingent">{{ $bc }}</div>
+    @endif
+</td>
+
+{{-- RED --}}
+<td class="red-corner" style="width: 25%;">
+    @php
+        $rn = $row['red']['names'] ?? null;
+        $rc = $row['red']['contingent'] ?? null;
+    @endphp
+
+    @if($rn)
+        <div class="names">{{ $rn }}</div>
+    @elseif(!empty($row['source_red_text']))
+        <div class="names">{{ $row['source_red_text'] }}</div>
+    @elseif(!empty($row['source_red_order']))
+        <div class="names">Pemenang Partai #{{ $row['source_red_order'] }}</div>
+    @else
+        <div class="names">-</div>
+    @endif
+
+    @if($rc)
+        <div class="contingent">{{ $rc }}</div>
+    @endif
+</td>
+
 
                     {{-- waktu/score kiri-kanan (simetris) --}}
                     <td class="text-center">{{ $row['time']  ?? '-' }}</td>
