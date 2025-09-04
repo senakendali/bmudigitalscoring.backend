@@ -847,7 +847,289 @@ class SeniMatchController extends Controller
         return $round ? "Babak {$round}" : "Babak";
     }
 
-   public function export(Request $request)
+    public function export(Request $request)
+{
+    $arena = $request->query('arena_name');
+    $date  = $request->query('scheduled_date');
+
+    if (!$arena || !$date) {
+        return abort(400, 'Parameter arena_name dan scheduled_date wajib diisi');
+    }
+
+    // Cari tournament dari kombinasi arena+tanggal
+    $probe = MatchScheduleDetail::with(['schedule.tournament', 'schedule.arena'])
+        ->whereHas('schedule', fn($q) => $q->where('scheduled_date', $date))
+        ->whereHas('schedule.arena', fn($q) => $q->where('name', $arena))
+        ->first();
+
+    if (!$probe || !$probe->schedule?->tournament_id) {
+        return abort(404, 'Data tidak ditemukan');
+    }
+
+    $tournamentId   = $probe->schedule->tournament_id;
+    $tournamentName = $probe->schedule->tournament->name ?? '-';
+
+    // ===== A) Bangun indeks utk seluruh turnamen (parent bisa lintas hari/arena)
+    $allDetails = MatchScheduleDetail::with([
+        'schedule.arena',
+        'schedule.tournament',
+        'seniMatch.pool.ageCategory',
+        'seniMatch.matchCategory',
+    ])->whereHas('schedule', fn($q) => $q->where('tournament_id', $tournamentId))
+      ->get();
+
+    if ($allDetails->isEmpty()) {
+        return abort(404, 'Data tidak ditemukan');
+    }
+
+    // seni_match_id -> order (global)
+    $orderBySeniId = [];
+    foreach ($allDetails as $d) {
+        if ($d->seni_match_id && $d->order) {
+            $orderBySeniId[(int)$d->seni_match_id] = (int)$d->order;
+        }
+    }
+
+    // ===== B) Ambil detail utk arena & tanggal yg diminta
+    $details = MatchScheduleDetail::with([
+        'schedule.arena',
+        'schedule.tournament',
+        'seniMatch.contingent',
+        'seniMatch.teamMember1',
+        'seniMatch.teamMember2',
+        'seniMatch.teamMember3',
+        'seniMatch.pool.ageCategory',
+        'seniMatch.matchCategory',
+    ])
+    ->whereHas('schedule', fn($q) => $q->where('scheduled_date', $date))
+    ->whereHas('schedule.arena', fn($q) => $q->where('name', $arena))
+    ->orderBy('order')
+    ->get();
+
+    if ($details->isEmpty()) {
+        return abort(404, 'Data tidak ditemukan');
+    }
+
+    // ===== C) Build payload (murni pakai parent_*_id utk "Pemenang Partai #X")
+    $grouped = [];
+
+    foreach ($details as $detail) {
+        $m = $detail->seniMatch;
+        if (!$m) continue;
+
+        $arenaName     = $detail->schedule->arena->name ?? 'Tanpa Arena';
+        $scheduledDate = $detail->schedule->scheduled_date ?? 'Tanpa Tanggal';
+        $poolName      = $m->pool->name ?? 'Tanpa Pool';
+        $category      = $m->matchCategory->name ?? '-';
+        $gender        = $m->gender ?? '-';
+        $ageCategory   = optional($m->pool?->ageCategory)->name ?? '-';
+        $matchType     = $m->match_type;
+
+        // Corner-based parent → order
+        $sourceBlueOrder = null;
+        $sourceRedOrder  = null;
+
+        if (($m->mode ?? null) === 'battle') {
+            $pb = $m->parent_match_blue_id ?? null;
+            $pr = $m->parent_match_red_id  ?? null;
+
+            if ($pb) $sourceBlueOrder = $orderBySeniId[(int)$pb] ?? null;
+            if ($pr) $sourceRedOrder  = $orderBySeniId[(int)$pr] ?? null;
+        }
+
+        $genderLabel = $gender === 'male' ? 'PUTRA' : ($gender === 'female' ? 'PUTRI' : strtoupper($gender));
+        $classLabel  = strtoupper(trim(($category ? $category.' ' : '').($ageCategory ? $ageCategory.' ' : '').$genderLabel));
+
+        $groupKey    = $arenaName . '||' . $scheduledDate;
+        $categoryKey = $category . '|' . $gender . '|' . $ageCategory;
+
+        $matchData = [
+            'id'               => $m->id,
+            'match_order'      => $detail->order,
+            'match_time'       => $detail->start_time,
+            'mode'             => $m->mode,
+            'corner'           => $m->corner,           // penting: 1 match = 2 row, corner berbeda
+            'round_label'      => $detail->round_label,
+            'battle_group'     => $m->battle_group,
+            'contingent'       => optional($m->contingent)?->only(['id', 'name']),
+            'team_member1'     => optional($m->teamMember1)?->only(['id', 'name']),
+            'team_member2'     => optional($m->teamMember2)?->only(['id', 'name']),
+            'team_member3'     => optional($m->teamMember3)?->only(['id', 'name']),
+            'match_type'       => $matchType,
+            'scheduled_date'   => $scheduledDate,
+            'tournament_name'  => $tournamentName,
+            'arena_name'       => $arenaName,
+            'pool'             => [
+                'name'         => $poolName,
+                'age_category' => ['name' => $ageCategory],
+            ],
+            'gender'           => $gender,
+            'category_name'    => $category,
+            'class_label'      => $classLabel,
+
+            // corner-specific: hanya isi yg sesuai corner row ini
+            'source_blue_order'=> strtolower($m->corner ?? '') === 'blue' ? $sourceBlueOrder : null,
+            'source_red_order' => strtolower($m->corner ?? '') === 'red'  ? $sourceRedOrder  : null,
+
+            // alias lama (abaikan oleh PDF/FE baru, tapi aman disertakan)
+            'source_type'      => $m->source_type ?? null,
+            'source_from_order'=> null,
+            'winner_of_order'  => null,
+        ];
+
+        $grouped[$groupKey]['arena_name']      = $arenaName;
+        $grouped[$groupKey]['scheduled_date']  = $scheduledDate;
+        $grouped[$groupKey]['tournament_name'] = $tournamentName;
+
+        $grouped[$groupKey]['groups'][$categoryKey]['category']     = $category;
+        $grouped[$groupKey]['groups'][$categoryKey]['gender']       = $gender;
+        $grouped[$groupKey]['groups'][$categoryKey]['age_category'] = $ageCategory;
+
+        $grouped[$groupKey]['groups'][$categoryKey]['pools'][$poolName]['name'] = $poolName;
+        $grouped[$groupKey]['groups'][$categoryKey]['pools'][$poolName]['matches'][] = $matchData;
+    }
+
+    // ===== D) Format akhir
+    $result = [];
+    foreach ($grouped as $entry) {
+        $groups = [];
+        foreach ($entry['groups'] as $group) {
+            $pools = [];
+            foreach ($group['pools'] as $pool) {
+                $pools[] = [
+                    'name'    => $pool['name'],
+                    'matches' => $pool['matches'],
+                ];
+            }
+            $groups[] = [
+                'category'      => $group['category'],
+                'gender'        => $group['gender'],
+                'age_category'  => $group['age_category'],
+                'pools'         => $pools,
+            ];
+        }
+        $result[] = [
+            'arena_name'      => $entry['arena_name'],
+            'scheduled_date'  => $entry['scheduled_date'],
+            'tournament_name' => $entry['tournament_name'],
+            'groups'          => $groups,
+        ];
+    }
+
+    // Ambil entry (arena+tanggal) yang diminta
+    $data = collect($result)->first(fn($r) =>
+        ($r['arena_name'] === $arena) && ($r['scheduled_date'] === $date)
+    );
+    if (!$data) {
+        return abort(404, 'Data tidak ditemukan untuk kombinasi arena & tanggal tersebut');
+    }
+
+    // ===== E) Turunkan ke struktur siap-render (gabung 2 row per partai)
+    $battleRowsMap = []; // order => row
+    foreach ($data['groups'] as $g) {
+        $category = $g['category'];
+        $gender   = $g['gender'];
+        $age      = $g['age_category'];
+        foreach ($g['pools'] as $p) {
+            foreach ($p['matches'] as $m) {
+                if (($m['mode'] ?? null) !== 'battle') continue;
+
+                $order = $m['match_order'];
+                if ($order === null) continue;
+
+                if (!isset($battleRowsMap[$order])) {
+                    $battleRowsMap[$order] = [
+                        'order'             => $order,
+                        'round_label'       => $m['round_label'] ?? null,
+                        'class_label'       => $m['class_label'] ?? strtoupper(trim(($category ? $category.' ' : '').($age ? $age.' ' : '').($gender === 'male' ? 'PUTRA' : ($gender === 'female' ? 'PUTRI' : strtoupper($gender))))),
+                        'blue'              => ['names' => null, 'contingent' => null],
+                        'red'               => ['names' => null, 'contingent' => null],
+                        'time'              => $m['match_time'] ?? null,
+                        'score'             => null,
+                        'source_blue_order' => null,
+                        'source_red_order'  => null,
+                    ];
+                }
+
+                $row = &$battleRowsMap[$order];
+
+                if (!$row['round_label'] && !empty($m['round_label'])) $row['round_label'] = $m['round_label'];
+                if (!$row['time'] && !empty($m['match_time']))          $row['time']        = $m['match_time'];
+
+                // nama/contingent per row
+                $names = array_filter([
+                    $m['team_member1']['name'] ?? null,
+                    $m['team_member2']['name'] ?? null,
+                    $m['team_member3']['name'] ?? null,
+                ]);
+                $side = [
+                    'names'      => count($names) ? implode(' / ', $names) : null,
+                    'contingent' => $m['contingent']['name'] ?? null,
+                ];
+
+                $corner = strtolower($m['corner'] ?? '');
+                if ($corner === 'blue') {
+                    $row['blue'] = $side;
+                    if (!empty($m['source_blue_order'])) {
+                        $row['source_blue_order'] = $m['source_blue_order'];
+                    }
+                } elseif ($corner === 'red') {
+                    $row['red']  = $side;
+                    if (!empty($m['source_red_order'])) {
+                        $row['source_red_order'] = $m['source_red_order'];
+                    }
+                } else {
+                    // fallback parity (sangat jarang dipakai)
+                    if ($order % 2 === 0) $row['red'] = $side; else $row['blue'] = $side;
+                }
+
+                unset($row);
+            }
+        }
+    }
+    ksort($battleRowsMap);
+    $battleRows = array_values($battleRowsMap);
+
+    // Non-battle tables (tetap)
+    $nonBattleTables = [];
+    foreach ($data['groups'] as $g) {
+        $gender = $g['gender'];
+        foreach ($g['pools'] as $p) {
+            $rows = array_values(array_filter($p['matches'], fn($mm) => ($mm['mode'] ?? null) !== 'battle'));
+            if (empty($rows)) continue;
+
+            usort($rows, fn($a,$b) => ($a['match_order'] ?? 0) <=> ($b['match_order'] ?? 0));
+
+            $age = $g['age_category'] ?? '-';
+            $nonBattleTables[] = [
+                'key'   => $g['category'].'|'.$gender.'|'.$age.'|'.$p['name'],
+                'title' => [
+                    'category' => $g['category'],
+                    'gender'   => $gender,
+                    'age'      => $age,
+                    'pool'     => $p['name'],
+                ],
+                'rows'  => $rows,
+            ];
+        }
+    }
+
+    // ===== F) Render PDF
+    $pdf = \Barryvdh\DomPDF\Facade\Pdf::loadView(
+        'exports.seni-schedule',
+        [
+            'data'              => $data,
+            'battle_rows'       => $battleRows,       // tabel gabungan battle
+            'non_battle_tables' => $nonBattleTables,  // tabel per pool non-battle
+        ]
+    )->setPaper('a4', 'portrait');
+
+    $filename = 'jadwal-' . str_replace(' ', '-', strtolower($arena)) . '-' . $date . '.pdf';
+    return $pdf->download($filename);
+}
+
+
+   public function export_hampir_bener(Request $request)
 {
     $arena = $request->query('arena_name');
     $date  = $request->query('scheduled_date');
