@@ -1677,6 +1677,158 @@ class SeniMatchController extends Controller
     }
 
     public function matchList(Request $request)
+    {
+        $tournamentId     = $request->query('tournament_id');
+        $includeScheduled = $request->boolean('include_scheduled');
+        $mode             = $request->query('mode'); // optional
+
+        $query = SeniMatch::with([
+            'matchCategory',
+            'contingent',
+            'teamMember1',
+            'teamMember2',
+            'teamMember3',
+            'pool.ageCategory',
+        ])
+        ->orderBy('pool_id')
+        ->orderBy('match_order');
+
+        // Exclude yang sudah dijadwalkan (kecuali diminta include)
+        if (!$includeScheduled) {
+            $query->whereNotExists(function ($sub) {
+                $sub->select(DB::raw(1))
+                    ->from('match_schedule_details')
+                    ->whereColumn('match_schedule_details.seni_match_id', 'seni_matches.id');
+            });
+        }
+
+        // Filter tournament
+        if ($tournamentId) {
+            $query->whereHas('pool', function ($q) use ($tournamentId) {
+                $q->where('tournament_id', $tournamentId);
+            });
+        }
+
+        // (opsional) batasi mode
+        if ($mode) {
+            $query->where('mode', $mode);
+        }
+
+        $matches = $query->get();
+
+        /**
+         * ====== HIDE BYE HANYA DI BABAK AWAL PER POOL (MODE BATTLE) ======
+         * - Tentukan earliest round per pool (mis. 1; bisa >1 pada kasus tertentu)
+         * - Untuk setiap (pool_id, battle_group) di ronde paling awal pool tsb:
+         *     • Jika jumlah entri < 2  → BYE → hide
+         *     • Jika 2 entri tapi salah satu sisi tanpa pemain real → BYE → hide
+         * - Babak selain earliest round TIDAK DISENTUH.
+         */
+        $battle = $matches->where('mode', 'battle');
+
+        if ($battle->isNotEmpty()) {
+            // Earliest round per pool (khusus battle)
+            $minRoundByPool = $battle
+                ->groupBy('pool_id')
+                ->map(fn($col) => (int) $col->min('round'));
+
+            // helper: ada pemain real?
+            $hasReal = function ($m) {
+                if (!$m) return false;
+
+                $tm1 = $m->team_member_1 ?? null;
+                $tm2 = $m->team_member_2 ?? null;
+                $tm3 = $m->team_member_3 ?? null;
+
+                switch ($m->match_type) {
+                    case 'seni_ganda':
+                        return !empty($tm1) || !empty($tm2);
+                    case 'seni_regu':
+                        return !empty($tm1) || !empty($tm2) || !empty($tm3);
+                    // treat 'solo_kreatif' seperti tunggal (1 orang)
+                    case 'solo_kreatif':
+                    case 'seni_tunggal':
+                    default:
+                        return !empty($tm1);
+                }
+            };
+
+            // Group per POOL + battle_group agar tidak tercampur antar pool
+            $groups = $battle
+                ->filter(fn($m) => !empty($m->battle_group))
+                ->groupBy(fn($m) => $m->pool_id . '|' . $m->battle_group);
+
+            $idsToHide = collect();
+
+            foreach ($groups as $key => $groupMatches) {
+                [$poolIdStr, $bgStr] = explode('|', $key);
+                $poolId = (int) $poolIdStr;
+
+                $earliestRound = $minRoundByPool[$poolId] ?? 1;
+
+                // hanya entri di babak paling awal untuk group ini
+                $firstRoundEntries = $groupMatches
+                    ->filter(fn($m) => (int) $m->round === $earliestRound)
+                    ->values();
+
+                // 1) Hanya 1 entri → BYE
+                if ($firstRoundEntries->count() < 2) {
+                    $idsToHide = $idsToHide->merge($firstRoundEntries->pluck('id'));
+                    continue;
+                }
+
+                // 2) Ada 2 entri → cek apakah salah satu sisi kosong (tanpa pemain real)
+                $blue = $firstRoundEntries->firstWhere('corner', 'blue');
+                $red  = $firstRoundEntries->firstWhere('corner', 'red');
+
+                // Jika struktur data aneh (nggak ketemu blue/red), anggap BYE dan hide semua entri babak awal group tsb
+                if (!$blue || !$red) {
+                    $idsToHide = $idsToHide->merge($firstRoundEntries->pluck('id'));
+                    continue;
+                }
+
+                $blueHasReal = $hasReal($blue);
+                $redHasReal  = $hasReal($red);
+
+                if (!($blueHasReal && $redHasReal)) {
+                    // salah satu sisi tidak ada pemain real → BYE → hide keduanya
+                    $idsToHide = $idsToHide->merge($firstRoundEntries->pluck('id'));
+                }
+            }
+
+            if ($idsToHide->isNotEmpty()) {
+                $matches = $matches->reject(fn($m) => $idsToHide->contains($m->id))->values();
+            }
+        }
+
+        // Group by age_category + match category + gender (struktur tetap)
+        $grouped = $matches->groupBy(fn($match) =>
+            ($match->pool->ageCategory->name ?? '-') . '|' .
+            ($match->matchCategory->name ?? '-') . '|' .
+            ($match->gender ?? '-')
+        )
+        ->map(function ($matchesByGroup, $key) {
+            [$ageCategory, $category, $gender] = explode('|', $key);
+
+            return [
+                'age_category' => $ageCategory,
+                'category'     => $category,
+                'gender'       => $gender,
+                'pools'        => $matchesByGroup->groupBy(fn($match) => $match->pool->name ?? 'Pool')
+                    ->map(function ($poolMatches, $poolName) {
+                        return [
+                            'name'    => $poolName,
+                            'matches' => $poolMatches->values(),
+                        ];
+                    })->values(),
+            ];
+        })->values();
+
+        return response()->json($grouped);
+    }
+
+
+    public function matchList__bakcup(Request $request)
 {
     $tournamentId     = $request->query('tournament_id');
     $includeScheduled = $request->boolean('include_scheduled');
