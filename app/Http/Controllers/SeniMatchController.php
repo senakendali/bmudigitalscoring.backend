@@ -5104,7 +5104,7 @@ class SeniMatchController extends Controller
         }
         if ($mode === null) $mode = 'default';
 
-        // --- Kumpulkan tim yang memang ada di pool ini ---
+        // --- Kumpulkan tim yang memang ada di pool ini (tanpa dummy) ---
         $makeTeamKey = function (?int $contingentId, array $memberIds): string {
             $ids = array_values(array_filter(array_map('intval', $memberIds), fn($v) => $v > 0));
             sort($ids, SORT_NUMERIC);
@@ -5142,19 +5142,7 @@ class SeniMatchController extends Controller
             foreach ($oldMatches as $m) $addTeam($m);
         }
 
-        // Guard: untuk battle + full_prestasi, minimal 6 tim (tidak bikin dummy di sini)
-        if ($mode === 'battle' && $bracketType === 'full_prestasi') {
-            $currentTeams = count($teams);
-            if ($currentTeams < 6) {
-                DB::rollBack();
-                return response()->json([
-                    'message' => "Pool full_prestasi ini berisi {$currentTeams} tim (< 6). "
-                               . "Dummy hanya dibuat saat generate/regenerate global. "
-                               . "Silakan jalankan generate/regenerate untuk kategori ini agar kuota minimal terpenuhi.",
-                ], 422);
-            }
-        }
-
+        // ❌ HAPUS GUARD MINIMAL 6 untuk full_prestasi — kita tidak bikin dummy
         if (empty($teams)) {
             DB::rollBack();
             return response()->json([
@@ -5198,10 +5186,10 @@ class SeniMatchController extends Controller
             ]);
         }
 
-        // ======================= BATTLE / BRACKET =======================
+        // ======================= BATTLE / BRACKET (tanpa dummy) =======================
         $N = $bag->count();
 
-        // N=1 → Final only
+        // N=1 → Final only (tanpa lawan)
         if ($N === 1) {
             $only = $bag->first();
             $round       = 1;
@@ -5236,11 +5224,11 @@ class SeniMatchController extends Controller
             ]);
         }
 
-        // K = nextPow2(N) (power-of-two, ≥ N)
+        // K = nextPow2(N)
         $K = max(2, $this->nextPow2($N));
         $totalRounds = (int) log($K, 2);
 
-        // Ronde 1: sisipkan BYE dulu, lalu pairing normal
+        // Ronde 1: sisipkan BYE dulu, lalu pairing normal (tanpa dummy)
         $pairings    = []; // [blueTeam|null, redTeam|null]
         $battleGroup = 1;
 
@@ -5374,7 +5362,7 @@ class SeniMatchController extends Controller
             $battleGroup++;
         }
 
-        // Ronde berikutnya: carry-forward jika 1 parent; buat node + prefill jika 2 parent
+        // Ronde berikutnya: carry-forward jika 1 parent; buat node + prefill bila parent BYE
         while (count($currentRound) > 1) {
             $round++;
             $roundLabel = $this->getRoundLabel($round, $totalRounds);
@@ -5478,7 +5466,7 @@ class SeniMatchController extends Controller
         DB::commit();
 
         return response()->json([
-            'message' => 'Regenerate pool (battle) berhasil.',
+            'message' => 'Regenerate pool (battle, no dummy) berhasil.',
             'pool_id' => $pool->id,
             'mode'    => 'battle',
         ]);
@@ -5491,6 +5479,7 @@ class SeniMatchController extends Controller
         ], 500);
     }
 }
+
 
 
 
