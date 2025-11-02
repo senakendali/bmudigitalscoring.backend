@@ -2136,7 +2136,7 @@ class SeniMatchController extends Controller
 
         // === Konfigurasi dasar
         $matchCategory = (int) $validated['match_category_id'];
-        $poolSize      = (int) $validated['pool_size']; // jumlah penampil per pool
+        $poolSize      = (int) $validated['pool_size']; // "jumlah penampil per pool"
         $gender        = $validated['gender'];
         $tournamentId  = (int) $validated['tournament_id'];
         $ageCategoryId = (int) $validated['age_category_id'];
@@ -2161,6 +2161,7 @@ class SeniMatchController extends Controller
                 ->groupBy(fn($tp) => $tp->participant->contingent_id)
                 ->map(function ($group) use ($teamSize) {
                     $members = $group->pluck('participant')->filter()->shuffle()->values();
+                    // pecah jadi tim full berukuran teamSize
                     return $members->chunk($teamSize)
                         ->filter(fn($c) => $c->count() === $teamSize)
                         ->map(fn($c) => [
@@ -2194,11 +2195,9 @@ class SeniMatchController extends Controller
 
             for ($i=0; $i<$total; $i++) {
                 $pickedCid = null;
-                // prioritas: cid != lastCid
                 foreach ($buckets as $cid => $arr) {
                     if (!empty($arr) && $cid !== $lastCid) { $pickedCid = $cid; break; }
                 }
-                // fallback: ambil yang masih ada
                 if ($pickedCid === null) {
                     foreach ($buckets as $cid => $arr) {
                         if (!empty($arr)) { $pickedCid = $cid; break; }
@@ -2213,108 +2212,16 @@ class SeniMatchController extends Controller
             return collect($result);
         };
 
-        // === Helper: distribusi multi-pool prioritas beda kontingen (relaksasi bila perlu)
-        $distributeToPools = function (\Illuminate\Support\Collection $unitList, int $poolSize) use ($alternateOrder) {
-            $totalUnits = $unitList->count();
-            $poolCount  = (int) ceil($totalUnits / max(1, $poolSize));
-            if ($poolCount <= 1) return [ $unitList->values() ];
-
-            // bucket per contingent
-            $buckets = [];
-            foreach ($unitList as $u) {
-                $cid = $u['contingent_id'] ?? 0;
-                $buckets[$cid] = $buckets[$cid] ?? [];
-                $buckets[$cid][] = $u;
-            }
-            // urutkan contingent paling banyak dulu
-            uasort($buckets, fn($a,$b)=>count($b)<=>count($a));
-
-            // inisialisasi pool
-            $pools = array_fill(0, $poolCount, []);
-            $poolContingents = array_fill(0, $poolCount, []); // set of cid per pool
-            $remaining = array_sum(array_map('count', $buckets));
-
-            // Pass 1: isi dengan constraint "tidak ada cid yang sama" per pool (selama bisa)
-            while ($remaining > 0) {
-                // pool urut by size asc supaya merata
-                $poolOrder = range(0, $poolCount-1);
-                usort($poolOrder, function ($a, $b) use ($pools) {
-                    return count($pools[$a]) <=> count($pools[$b]);
-                });
-
-                $progress = false;
-
-                foreach ($poolOrder as $pi) {
-                    if (count($pools[$pi]) >= $poolSize) continue;
-
-                    // cari bucket dengan cid yang BELUM ada di pool ini
-                    $pickedCid = null;
-                    foreach ($buckets as $cid => $arr) {
-                        if (!empty($arr) && !in_array($cid, $poolContingents[$pi], true)) {
-                            $pickedCid = $cid; break;
-                        }
-                    }
-
-                    if ($pickedCid === null) continue; // tunda ke pass 2
-                    $item = array_shift($buckets[$pickedCid]);
-                    $pools[$pi][] = $item;
-                    $poolContingents[$pi][] = $pickedCid;
-                    $remaining--;
-                    $progress = true;
-                    if ($remaining <= 0) break;
-                }
-
-                if (!$progress) break; // tidak bisa tambah tanpa melanggar constraint → lanjut pass 2
-            }
-
-            // Pass 2: relaksasi (boleh cid sama dalam pool) untuk sisa item
-            while ($remaining > 0) {
-                $poolOrder = range(0, $poolCount-1);
-                usort($poolOrder, function ($a, $b) use ($pools) {
-                    return count($pools[$a]) <=> count($pools[$b]);
-                });
-
-                $progress = false;
-
-                foreach ($poolOrder as $pi) {
-                    if (count($pools[$pi]) >= $poolSize) continue;
-
-                    // ambil dari bucket manapun yang masih ada
-                    $pickedCid = null;
-                    foreach ($buckets as $cid => $arr) {
-                        if (!empty($arr)) { $pickedCid = $cid; break; }
-                    }
-                    if ($pickedCid === null) break; // habis semua
-
-                    $item = array_shift($buckets[$pickedCid]);
-                    $pools[$pi][] = $item;
-                    if (!in_array($pickedCid, $poolContingents[$pi], true)) {
-                        $poolContingents[$pi][] = $pickedCid;
-                    }
-                    $remaining--;
-                    $progress = true;
-                    if ($remaining <= 0) break;
-                }
-
-                if (!$progress) break;
-            }
-
-            // Rapikan urutan di tiap pool (selang-seling kontingen)
-            return array_map(function ($arr) use ($alternateOrder) {
-                return $alternateOrder(collect($arr)->values());
-            }, $pools);
-        };
-
         $usedMemberIds = [];
         $totalUnits = $units->count();
 
         // ============================
         // RULE:
-        // 1) Jika pool_size >= totalUnits => single pool (prioritas beda kontingen).
-        // 2) Jika pool_size <  totalUnits => bagi ke beberapa pool (prioritas beda kontingen, relaksasi bila perlu).
+        // 1) Jika pool_size >= totalUnits => single pool (tanpa dummy).
+        // 2) Jika pool_size <  totalUnits => bagi ke beberapa pool (tanpa dummy).
         // ============================
 
-        // CASE A: Single Pool
+        // CASE A: Single Pool (tidak dibagi)
         if ($poolSize >= $totalUnits) {
             $ordered = $alternateOrder($units->values());
 
@@ -2352,7 +2259,7 @@ class SeniMatchController extends Controller
                         default => 'seni_tunggal',
                     },
                     'contingent_id'     => $unit['contingent_id'],
-                    'team_member_1'     => $teamSize >= 1 ? ($memberIds[0] ?? null) : null,
+                    'team_member_1'     => $memberIds[0] ?? null,
                     'team_member_2'     => $teamSize >= 2 ? ($memberIds[1] ?? null) : null,
                     'team_member_3'     => $teamSize >= 3 ? ($memberIds[2] ?? null) : null,
                 ]);
@@ -2365,10 +2272,12 @@ class SeniMatchController extends Controller
             ]);
         }
 
-        // CASE B: Multi-pool dengan prioritas beda kontingen
-        $poolsUnits = $distributeToPools($units->values(), $poolSize); // array of collections
+        // CASE B: Dibagi ke beberapa pool (chunk by pool_size)
+        $chunks = $units->chunk($poolSize)->values();
 
-        foreach ($poolsUnits as $i => $chunkOrdered) {
+        foreach ($chunks as $i => $chunk) {
+            $ordered = $alternateOrder($chunk->values());
+
             // Buat pool i
             $pool = \App\Models\SeniPool::create([
                 'tournament_id'     => $tournamentId,
@@ -2380,7 +2289,7 @@ class SeniMatchController extends Controller
             ]);
 
             // Assign tp.pool_id
-            $memberIdsInPool = $chunkOrdered->flatMap(fn($u) => $u['members'])->unique()->values();
+            $memberIdsInPool = $ordered->flatMap(fn($u) => $u['members'])->unique()->values();
             if ($memberIdsInPool->isNotEmpty()) {
                 \App\Models\TournamentParticipant::whereIn('team_member_id', $memberIdsInPool->all())
                     ->where('tournament_id', $tournamentId)
@@ -2388,7 +2297,7 @@ class SeniMatchController extends Controller
             }
 
             // Insert match
-            foreach ($chunkOrdered->values() as $idx => $unit) {
+            foreach ($ordered->values() as $idx => $unit) {
                 $memberIds = collect($unit['members'])->values();
                 if ($memberIds->intersect($usedMemberIds)->isNotEmpty()) continue;
 
@@ -2403,7 +2312,7 @@ class SeniMatchController extends Controller
                         default => 'seni_tunggal',
                     },
                     'contingent_id'     => $unit['contingent_id'],
-                    'team_member_1'     => $teamSize >= 1 ? ($memberIds[0] ?? null) : null,
+                    'team_member_1'     => $memberIds[0] ?? null,
                     'team_member_2'     => $teamSize >= 2 ? ($memberIds[1] ?? null) : null,
                     'team_member_3'     => $teamSize >= 3 ? ($memberIds[2] ?? null) : null,
                 ]);
@@ -2416,8 +2325,6 @@ class SeniMatchController extends Controller
             'message' => 'Seni matches created (pool mode) successfully.'
         ]);
     }
-
-
 
 
         /**
