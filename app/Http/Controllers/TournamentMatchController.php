@@ -322,7 +322,7 @@ class TournamentMatchController extends Controller
 
 
 
-   private function generateBracketForSix($poolId, $participants = null)
+   private function generateBracketForSix__dummy($poolId, $participants = null)
 {
     return DB::transaction(function () use ($poolId, $participants) {
         TournamentMatch::where('pool_id', $poolId)->delete();
@@ -706,7 +706,7 @@ class TournamentMatchController extends Controller
     
     
 
-   private function generateBracketForSix_bukan_dummy($poolId, $participants)
+   private function generateBracketForSix($poolId, $participants)
     {
         return DB::transaction(function () use ($poolId, $participants) {
             TournamentMatch::where('pool_id', $poolId)->delete();
