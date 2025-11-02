@@ -2830,33 +2830,82 @@ class TournamentMatchController extends Controller
                 return response()->json(['message' => 'Pool tidak ditemukan.'], 404);
             }
 
-            // ===== Normalisasi peserta → ambil id saja (handle object/array/scalar) =====
-            $incomingIds = collect($participants)->map(function ($p) {
-                if (is_object($p)) {
-                    return $p->id ?? $p->team_member_id ?? null;
+            // --- util: bikin dummy opponent konsisten dengan Full Prestasi ---
+            $dummyContingentPool = [310, 311, 312, 313, 314, 315];
+            $addedDummies = 0;
+
+            $makeDummyFor = function ($templateTmId, $gender = null) use ($pool, $dummyContingentPool, $tournamentId, &$addedDummies) {
+                if (method_exists($this, 'ensureContingentsExist')) {
+                    $this->ensureContingentsExist($dummyContingentPool, $tournamentId);
                 }
-                if (is_array($p)) {
-                    return $p['id'] ?? $p['team_member_id'] ?? null;
+
+                $template = \App\Models\TeamMember::find($templateTmId);
+                if (!$template) {
+                    $template = \App\Models\TeamMember::query()
+                        ->where('category_class_id', $pool->category_class_id)
+                        ->where('match_category_id', $pool->match_category_id)
+                        ->when(Schema::hasColumn('team_members','gender') && $gender, fn($q) => $q->where('gender', $gender))
+                        ->first();
                 }
-                return $p; // scalar
-            })->filter()->unique()->values();
+                $chosenContingent = $dummyContingentPool[array_rand($dummyContingentPool)];
 
-            if ($incomingIds->isEmpty()) {
-                return response()->json(['message' => 'Tidak ada peserta yang dikirim.'], 400);
-            }
+                if (method_exists($this, 'createDummyTeamMemberAndRegister')) {
+                    $this->createDummyTeamMemberAndRegister(
+                        $template,
+                        $chosenContingent,
+                        Schema::hasColumn('team_members','gender') ? ($gender ?? $template->gender) : null,
+                        $tournamentId,
+                        $pool->id,
+                        [
+                            'match_category_id' => $pool->match_category_id,
+                            'category_class_id' => $pool->category_class_id,
+                            // 'age_category_id' => $pool->age_category_id ?? $template?->age_category_id,
+                        ]
+                    );
 
-            // Ambil data lengkap team_members untuk filter (kelas, gender, kontingen)
-            $tmQuery = DB::table('team_members')->select(['id','contingent_id','category_class_id']);
-            $hasGenderCol = Schema::hasColumn('team_members','gender');
-            if ($hasGenderCol) $tmQuery->addSelect('gender');
+                    $addedDummies++;
 
-            /** @var \Illuminate\Support\Collection<int,\stdClass> $tm */
-            $tm = $tmQuery->whereIn('id', $incomingIds)->get()->keyBy('id');
-            if ($tm->isEmpty()) {
-                return response()->json(['message' => 'Peserta tidak ditemukan di team_members.'], 400);
-            }
+                    return DB::table('tournament_participants as tp')
+                        ->join('team_members as tm', 'tp.team_member_id', '=', 'tm.id')
+                        ->where('tp.tournament_id', $tournamentId)
+                        ->where('tp.pool_id', $pool->id)
+                        ->where('tm.category_class_id', $pool->category_class_id)
+                        ->where('tm.match_category_id', $pool->match_category_id)
+                        ->where('tm.contingent_id', $chosenContingent)
+                        ->orderByDesc('tp.id')
+                        ->value('tm.id');
+                }
 
-            // ===== Hindari peserta yang sudah dipakai di turnamen lain =====
+                // --- fallback inline ---
+                $dummyName   = 'Dummy ' . ($template?->name ? '(' . $template->name . ')' : strtoupper(uniqid()));
+                $dummyGender = Schema::hasColumn('team_members','gender') ? ($gender ?? $template?->gender ?? 'male') : null;
+
+                $dummyTmId = DB::table('team_members')->insertGetId(array_filter([
+                    'name'                     => $dummyName,
+                    'contingent_id'            => $chosenContingent,
+                    'gender'                   => $dummyGender,
+                    'championship_category_id' => $template?->championship_category_id,
+                    'age_category_id'          => $pool->age_category_id ?? $template?->age_category_id,
+                    'category_class_id'        => $pool->category_class_id,
+                    'match_category_id'        => $pool->match_category_id,
+                    'is_dummy'                 => Schema::hasColumn('team_members','is_dummy') ? 1 : null,
+                    'created_at'               => now(),
+                    'updated_at'               => now(),
+                ]));
+
+                DB::table('tournament_participants')->insert([
+                    'tournament_id'  => $tournamentId,
+                    'team_member_id' => $dummyTmId,
+                    'pool_id'        => $pool->id,
+                    'created_at'     => now(),
+                    'updated_at'     => now(),
+                ]);
+
+                $addedDummies++;
+                return $dummyTmId;
+            };
+
+            // Hindari peserta yang sudah dipakai di turnamen lain
             $usedParticipantIds = TournamentMatch::whereHas('pool', fn($q) =>
                 $q->where('tournament_id', $tournamentId)
             )->pluck('participant_1')
@@ -2866,70 +2915,66 @@ class TournamentMatchController extends Controller
                 )->pluck('participant_2')
             )->unique();
 
-            $incomingIds = $incomingIds->reject(fn($id) => $usedParticipantIds->contains($id))->values();
-            if ($incomingIds->isEmpty()) {
+            $participants = $participants->reject(fn($p) =>
+                $usedParticipantIds->contains($p->id)
+            )->values();
+
+            if ($participants->isEmpty()) {
                 return response()->json(['message' => 'Semua peserta sudah masuk match di pool lain.'], 400);
             }
 
-            // ===== Filter 1: kelas sama dengan pool =====
-            $classFilteredIds = $incomingIds->filter(function ($id) use ($tm, $pool) {
-                return (int)($tm[$id]->category_class_id ?? 0) === (int)$pool->category_class_id;
-            })->values();
+            $maxParticipantCount   = (int) $matchChart; // ukuran bracket (2,4,8,16,...)
+            $selectedParticipants  = $participants->slice(0, $maxParticipantCount)->values();
+            $participantIds        = $selectedParticipants->pluck('id')->toArray();
 
-            if ($classFilteredIds->isEmpty()) {
-                return response()->json(['message' => 'Tidak ada peserta dengan kelas yang sama dengan pool.'], 400);
-            }
-
-            // ===== Tentukan target gender lalu filter 2: gender sama =====
-            $targetGender = null;
-            if ($hasGenderCol) {
-                $poolHasGender = Schema::hasColumn('pools','gender') && !empty($pool->gender);
-                if ($poolHasGender) {
-                    $targetGender = $pool->gender;
-                } else {
-                    $first = $classFilteredIds->first();
-                    $targetGender = $first ? ($tm[$first]->gender ?? null) : null;
-                }
-
-                if (!is_null($targetGender)) {
-                    $classFilteredIds = $classFilteredIds->filter(fn($id) => ($tm[$id]->gender ?? null) === $targetGender)->values();
-                }
-                if ($classFilteredIds->isEmpty()) {
-                    return response()->json(['message' => 'Tidak ada peserta dengan gender yang cocok untuk pool ini.'], 400);
-                }
-            }
-
-            // ===== Batasi sesuai kapasitas bracket =====
-            $maxParticipantCount  = (int) $matchChart; // 2,4,8,16,...
-            $selectedIds          = $classFilteredIds->slice(0, $maxParticipantCount)->values();
-
-            // Assign pool_id ke peserta terpilih
-            TournamentParticipant::whereIn('team_member_id', $selectedIds)
+            // Assign ke pool
+            TournamentParticipant::whereIn('team_member_id', $participantIds)
                 ->where('tournament_id', $tournamentId)
                 ->update(['pool_id' => $poolId]);
 
-            // WARNING kalau jumlah kurang dari slot (slot sisa akan BYE)
+            // === NEW: jika jumlah peserta ganjil (termasuk 1) → tambah 1 dummy agar pairing R1 bukan BYE
+            if ($selectedParticipants->count() % 2 === 1) {
+                $tpl = $selectedParticipants->first();
+                $dummyId = $makeDummyFor($tpl->id, $tpl->gender ?? null);
+                if ($dummyId) {
+                    $selectedParticipants->push((object)[
+                        'id' => $dummyId,
+                        'gender' => $tpl->gender ?? null,
+                        'category_class_id' => $pool->category_class_id,
+                    ]);
+                    $participantIds = $selectedParticipants->pluck('id')->toArray();
+                }
+            }
+
+            // WARNING kalau jumlah kurang dari slot
             $warning = null;
-            if ($selectedIds->count() < $maxParticipantCount) {
-                $warning = "Peserta tidak ideal: ditemukan {$selectedIds->count()} dari {$maxParticipantCount}. Slot kosong menjadi BYE.";
+            if ($selectedParticipants->count() < $maxParticipantCount) {
+                $warning = "Peserta tidak ideal: ditemukan " . $selectedParticipants->count() . " dari $maxParticipantCount.";
             }
 
             $now          = now();
             $matchNumber  = 1;
             $matches      = collect();
-            $totalPeserta = $selectedIds->count();
+            $totalPeserta = count($participantIds);
 
-            // === 2 Peserta → Final langsung (tanpa dummy)
+            // === 1 Peserta (setelah penambahan dummy di atas, kasus ini harusnya jadi 2 peserta)
+            if ($totalPeserta === 1) {
+                // Safety net: tetap bikin dummy & final 1 vs dummy
+                $dummyId = $makeDummyFor($participantIds[0], null);
+                $participantIds[] = $dummyId;
+                $totalPeserta = 2;
+            }
+
+            // === 2 Peserta → Final langsung
             if ($totalPeserta === 2) {
-                $ids = $selectedIds->all();
                 $matches->push([
                     'pool_id' => $poolId,
                     'round' => 1,
                     'round_label' => 'Final',
                     'match_number' => $matchNumber++,
-                    'participant_1' => $ids[0],
-                    'participant_2' => $ids[1],
-                    'winner_id' => null, // tanding normal
+                    'participant_1' => $participantIds[0],
+                    'participant_2' => $participantIds[1],
+                    'winner_id' => null, // tanding normal (bukan auto-menang)
                     'next_match_id' => null,
                     'parent_match_red_id' => null,
                     'parent_match_blue_id' => null,
@@ -2940,9 +2985,10 @@ class TournamentMatchController extends Controller
                 DB::table('tournament_matches')->insert($matches->toArray());
 
                 return response()->json([
-                    'message' => '✅ Bracket 2 peserta: langsung final (tanpa dummy).',
+                    'message' => '✅ Bracket 2 peserta: langsung final (dummy dibuat bila perlu).',
                     'warning' => $warning,
-                    'rounds'  => TournamentMatch::where('pool_id', $poolId)
+                    'added_dummies' => $addedDummies,
+                    'rounds' => TournamentMatch::where('pool_id', $poolId)
                         ->orderBy('round')->orderBy('match_number')->get(),
                 ]);
             }
@@ -2998,26 +3044,23 @@ class TournamentMatchController extends Controller
                 }
             }
 
-            // === Pairing Peserta di Round 1 (utamakan kontingen berbeda, TANPA dummy)
-            $participantIds = $selectedIds->all();
-            $teamMembers = $tm->only($participantIds); // map id → tm row
+            // === Pairing Peserta di Round 1 (utamakan kontingen berbeda)
+            $teamMembers = DB::table('team_members')->whereIn('id', $participantIds)->get()->keyBy('id');
             $used  = [];
             $pairs = [];
 
             $preferDifferentContingent = function ($id1, $pool) use ($teamMembers) {
                 foreach ($pool as $k => $id2) {
-                    if (($teamMembers[$id1]->contingent_id ?? null) !== ($teamMembers[$id2]->contingent_id ?? null)) {
+                    if ($teamMembers[$id1]->contingent_id !== $teamMembers[$id2]->contingent_id) {
                         $partner = $id2;
                         unset($pool[$k]);
                         return [$partner, array_values($pool)];
                     }
                 }
-                // jika tidak ada yang beda kontingen, ambil yang ada (kelas+gender sudah aman)
                 if (!empty($pool)) {
                     $partner = array_shift($pool);
                     return [$partner, $pool];
                 }
-                // tidak ada partner → BYE
                 return [null, $pool];
             };
 
@@ -3036,51 +3079,60 @@ class TournamentMatchController extends Controller
                 // pick p2 dengan prefer beda kontingen
                 [$p2, $poolIds] = $preferDifferentContingent($p1, $poolIds);
 
-                // TANPA dummy: kalau null → BYE
+                // kalau p2 tetap null → buat dummy sekarang biar bukan BYE
+                if (!$p2) {
+                    $dummyId = $makeDummyFor($p1, $teamMembers[$p1]->gender ?? null);
+                    $p2 = $dummyId;
+                }
+
                 $pairs[] = [$p1, $p2];
-                $used[] = $p1;
-                if ($p2) $used[] = $p2;
+                $used[] = $p1; $used[] = $p2;
             }
 
-            // === Assign ke Round 1 + auto-advance untuk BYE
+            // === Assign ke Round 1
             $firstRoundMatches = $byRound[1]->values();
             foreach ($firstRoundMatches as $i => $match) {
                 $pair = $pairs[$i] ?? [null, null];
                 $match->participant_1 = $pair[0] ?? null;
                 $match->participant_2 = $pair[1] ?? null;
 
-                // BYE → participant_1 auto menang
+                // Jangan auto-winner untuk kasus dummy; biar tetap tanding normal.
+                // Auto-winner hanya jika slot kosong karena penyesuaian power-of-two (harusnya minim).
                 if ($match->participant_1 && !$match->participant_2) {
                     $match->winner_id = $match->participant_1;
                 }
+
                 $match->save();
             }
 
-            // === Special case: 1 peserta total → final BYE (tanpa dummy)
-            if (count($participantIds) === 1 && isset($byRound[$totalRounds])) {
+            // === Special Case lama untuk 3 peserta (optional, aman untuk tetap ada)
+            if (count($participantIds) === 3 && $totalRounds >= 2) {
                 $finalRound = $byRound[$totalRounds]->first();
-                if ($finalRound) {
-                    $finalRound->participant_1 = $participantIds[0];
-                    $finalRound->participant_2 = null;
-                    $finalRound->winner_id     = $participantIds[0];
-                    $finalRound->round_label   = 'Final';
-                    $finalRound->save();
+                $semiFinalMatches = $byRound[$totalRounds - 1] ?? collect();
+
+                foreach ($semiFinalMatches as $m) {
+                    if ($m->participant_1 && !$m->participant_2) {
+                        if (!$finalRound->participant_1) {
+                            $finalRound->participant_1 = $m->participant_1;
+                        } elseif (!$finalRound->participant_2) {
+                            $finalRound->participant_2 = $m->participant_1;
+                        }
+                        $m->winner_id = $m->participant_1;
+                        $m->save();
+                        $finalRound->save();
+                    }
                 }
             }
 
-            // === (opsional) Case lama 3 peserta → biarin BYE natural, tanpa dummy
-            // (blok khusus 3 peserta dihapus karena kita sudah handle BYE)
-
             return response()->json([
-                'message' => '✅ Bracket eliminasi tunggal dibuat (kelas & gender sama, prioritas beda kontingen, tanpa dummy).',
-                'warning' => $warning,
-                'gender'  => $hasGenderCol ? ($targetGender ?? null) : null,
-                'rounds'  => TournamentMatch::where('pool_id', $poolId)
+                'message'       => '✅ Bracket eliminasi tunggal berhasil dibuat (sisa 1 dipasangkan dummy).',
+                'warning'       => $warning,
+                'added_dummies' => $addedDummies,
+                'rounds'        => TournamentMatch::where('pool_id', $poolId)
                     ->orderBy('round')->orderBy('match_number')->get(),
             ]);
         });
     }
-
 
 
 

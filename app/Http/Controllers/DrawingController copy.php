@@ -663,7 +663,7 @@ class DrawingController extends Controller
             'tournament_id' => 'required|exists:tournaments,id',
             'match_category_id' => 'required|exists:match_categories,id',
             'age_category_id' => 'required|exists:age_categories,id',
-            'category_class_id' => 'required|exists:category_classes,id', // wajib sekarang
+            'category_class_id' => 'nullable|exists:category_classes,id', // tidak wajib
             'match_chart' => 'required|in:2,4,6,8,16,full_prestasi',
             'match_duration' => 'required|in:60,90,120,150,180,210,240,270,300'
         ]);
@@ -671,7 +671,6 @@ class DrawingController extends Controller
         $tournamentId = $request->tournament_id;
         $matchCategoryId = $request->match_category_id;
         $ageCategoryId = $request->age_category_id;
-        $categoryClassId = $request->category_class_id;
         $matchChart = $request->match_chart;
         $matchDuration = $request->match_duration;
 
@@ -690,85 +689,101 @@ class DrawingController extends Controller
             return response()->json(['message' => 'Kategori pertandingan atau usia tidak ditemukan di turnamen ini.'], 400);
         }
 
-        // ✅ Ambil peserta yang cocok
-        $validTeamMemberIds = DB::table('team_members')
-            ->where('match_category_id', $matchCategoryId)
-            ->where('age_category_id', $ageCategoryId)
-            ->where('category_class_id', $categoryClassId)
-            ->pluck('id')
-            ->toArray();
+        // ✅ Ambil semua kelas jika tidak dikirim
+        $categoryClassIds = $request->filled('category_class_id')
+            ? [$request->category_class_id]
+            : DB::table('team_members')
+                ->join('tournament_participants', 'team_members.id', '=', 'tournament_participants.team_member_id')
+                ->where('team_members.match_category_id', $matchCategoryId)
+                ->where('team_members.age_category_id', $ageCategoryId)
+                ->where('tournament_participants.tournament_id', $tournamentId)
+                ->pluck('team_members.category_class_id')
+                ->unique()
+                ->toArray();
 
-        if (count($validTeamMemberIds) === 0) {
-            return response()->json(['message' => 'Tidak ada peserta yang valid untuk kategori ini.'], 400);
+        if (empty($categoryClassIds)) {
+            return response()->json(['message' => 'Tidak ada kelas yang ditemukan untuk turnamen ini.'], 400);
         }
 
-        // ✅ Hitung peserta dalam turnamen
-        $totalParticipant = DB::table('tournament_participants')
-            ->where('tournament_id', $tournamentId)
-            ->whereIn('team_member_id', $validTeamMemberIds)
-            ->count();
+        $result = [];
 
-        if ($totalParticipant === 0) {
-            return response()->json(['message' => 'Tidak ada peserta ditemukan dalam turnamen ini untuk kategori tersebut.'], 400);
-        }
+        foreach ($categoryClassIds as $categoryClassId) {
+            // ✅ Ambil peserta valid
+            $validTeamMemberIds = DB::table('team_members')
+                ->where('match_category_id', $matchCategoryId)
+                ->where('age_category_id', $ageCategoryId)
+                ->where('category_class_id', $categoryClassId)
+                ->pluck('id')
+                ->toArray();
 
-        // ✅ Reset pool_id
-        DB::table('tournament_participants')
-            ->where('tournament_id', $tournamentId)
-            ->whereIn('team_member_id', $validTeamMemberIds)
-            ->update(['pool_id' => null]);
+            if (count($validTeamMemberIds) === 0) {
+                continue;
+            }
 
-        // ✅ Hapus pool lama
-        DB::table('pools')
-            ->where('tournament_id', $tournamentId)
-            ->where('match_category_id', $matchCategoryId)
-            ->where('age_category_id', $ageCategoryId)
-            ->where('category_class_id', $categoryClassId)
-            ->delete();
+            $totalParticipant = DB::table('tournament_participants')
+                ->where('tournament_id', $tournamentId)
+                ->whereIn('team_member_id', $validTeamMemberIds)
+                ->count();
 
-        // ✅ Hitung jumlah pool
-        /*$totalPools = match ($matchChart) {
-            'full_prestasi', 2 => 1,
-            default => ceil($totalParticipant / $matchChart),
-        };*/
+            if ($totalParticipant === 0) {
+                continue;
+            }
 
-        // ✅ Hitung jumlah pool
-        if ($matchChart === 'full_prestasi') {
-            $totalPools = 1;
-        } elseif ((int)$matchChart === 2) {
-            $totalPools = 1; // Karena logic generate 2 peserta = 1 match = 1 pool per class
-        } else {
-            $totalPools = ceil($totalParticipant / $matchChart);
-        }
+            // ✅ Reset pool_id & hapus pool lama
+            DB::table('tournament_participants')
+                ->where('tournament_id', $tournamentId)
+                ->whereIn('team_member_id', $validTeamMemberIds)
+                ->update(['pool_id' => null]);
 
+            DB::table('pools')
+                ->where('tournament_id', $tournamentId)
+                ->where('match_category_id', $matchCategoryId)
+                ->where('age_category_id', $ageCategoryId)
+                ->where('category_class_id', $categoryClassId)
+                ->delete();
 
-        
+            // ✅ Hitung jumlah pool
+            if ($matchChart === 'full_prestasi' || (int)$matchChart === 2) {
+                $totalPools = 1;
+            } else {
+                $totalPools = ceil($totalParticipant / $matchChart);
+            }
 
-        // ✅ Buat pool
-        $pools = [];
-        for ($i = 1; $i <= $totalPools; $i++) {
-            $pools[] = [
-                'tournament_id' => $tournamentId,
-                'match_category_id' => $matchCategoryId,
-                'age_category_id' => $ageCategoryId,
+            $pools = [];
+            for ($i = 1; $i <= $totalPools; $i++) {
+                $pools[] = [
+                    'tournament_id' => $tournamentId,
+                    'match_category_id' => $matchCategoryId,
+                    'age_category_id' => $ageCategoryId,
+                    'category_class_id' => $categoryClassId,
+                    'match_chart' => $matchChart === 'full_prestasi' ? 0 : $matchChart,
+                    'match_duration' => $matchDuration,
+                    'name' => "Pool {$i}",
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ];
+            }
+
+            DB::table('pools')->insert($pools);
+
+            $result[] = [
                 'category_class_id' => $categoryClassId,
-                'match_chart' => $matchChart === 'full_prestasi' ? 0 : $matchChart,
-                'match_duration' => $matchDuration,
-                'name' => "Pool {$i}",
-                'created_at' => now(),
-                'updated_at' => now(),
+                'total_participant' => $totalParticipant,
+                'total_pools' => $totalPools,
+                'pools' => $pools
             ];
         }
 
-        DB::table('pools')->insert($pools);
+        if (empty($result)) {
+            return response()->json(['message' => 'Tidak ada pool yang dibuat karena tidak ada peserta yang valid.'], 400);
+        }
 
         return response()->json([
             'message' => 'Pools berhasil dibuat',
-            'total_participant' => $totalParticipant,
-            'total_pools' => $totalPools,
-            'pools' => $pools
+            'data' => $result
         ]);
     }
+
 
 
 
@@ -991,6 +1006,54 @@ class DrawingController extends Controller
         return response()->json([
             'message' => 'Pools retrieved successfully',
             'data' => $tournamentMatches
+        ]);
+    }
+
+    public function getAllMatchRecap(Request $request)
+    {
+        $tournamentId = $request->query('tournament_id');
+
+        $matches = TournamentMatch::with([
+            'pool:id,name,tournament_id,category_class_id,age_category_id',
+            'pool.ageCategory:id,name',
+            'pool.categoryClass:id,name,gender,weight_min,weight_max',
+            'participantOne:id,name,contingent_id',
+            'participantOne.contingent:id,name',
+            'participantTwo:id,name,contingent_id',
+            'participantTwo.contingent:id,name',
+            'winner:id,name,contingent_id',
+            'winner.contingent:id,name'
+        ])
+        ->whereHas('pool', function ($query) use ($tournamentId) {
+            if ($tournamentId) {
+                $query->where('tournament_id', $tournamentId);
+            }
+        })
+        ->get();
+
+        $grouped = [];
+
+        foreach ($matches as $match) {
+            $age = $match->pool->ageCategory->name ?? 'Tanpa Usia';
+            $gender = $match->pool->categoryClass->gender ?? 'unknown';
+            $pool = $match->pool->name ?? 'Tanpa Pool';
+            $kelas = $match->pool->categoryClass->name ?? 'Gabungan Kelas';
+
+            $grouped[$age][$gender][$pool][$kelas][] = [
+                'match_id' => $match->id,
+                'round' => $match->round_label,
+                'participant_one_contingent' => $match->participantOne->contingent->name ?? '-',
+                'participant_two_contingent' => $match->participantTwo->contingent->name ?? '-',
+                'participant_one' => $match->participantOne->name ?? '-',
+                'participant_two' => $match->participantTwo->name ?? '-',
+                'winner' => $match->winner->name ?? '-',
+                'winner_contingent' => $match->winner->contingent->name ?? '-',
+            ];
+        }
+
+        return response()->json([
+            'status' => 'success',
+            'data' => $grouped
         ]);
     }
 
