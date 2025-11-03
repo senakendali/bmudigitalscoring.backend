@@ -35,197 +35,102 @@ class TournamentMatchController extends Controller
     }
     
 
-   public function generateBracket($poolId)
-{
-    // Ambil pool dan data penting
-    $pool = Pool::with('categoryClass')->find($poolId);
-    if (!$pool) {
-        return response()->json(['message' => 'Pool tidak ditemukan.'], 404);
+    public function generateBracket($poolId)
+    {
+        // Ambil pool dan data penting
+        $pool = Pool::with('categoryClass')->find($poolId);
+        if (!$pool) {
+            return response()->json(['message' => 'Pool tidak ditemukan.'], 404);
+        }
+
+        $tournamentId = $pool->tournament_id;
+        $matchChart = (int) $pool->match_chart;
+
+        $matchCategoryId = $pool->match_category_id;
+        $categoryClassId = $pool->category_class_id;
+        $ageCategoryId = $pool->age_category_id;
+
+        // Ambil peserta yang belum masuk ke match
+        $existingMatches = TournamentMatch::where('pool_id', $poolId)->pluck('participant_1')
+            ->merge(
+                TournamentMatch::where('pool_id', $poolId)->pluck('participant_2')
+            )->unique();
+
+        // 🔍 Ambil peserta berdasarkan match_category_id, class, dan usia
+        $participants = DB::table('tournament_participants')
+            ->join('team_members', 'tournament_participants.team_member_id', '=', 'team_members.id')
+            ->where('tournament_participants.tournament_id', $tournamentId)
+            ->whereNotIn('team_members.id', $existingMatches)
+            ->when($matchCategoryId, fn($q) => $q->where('team_members.match_category_id', $matchCategoryId))
+            ->when($categoryClassId, fn($q) => $q->where('team_members.category_class_id', $categoryClassId))
+            ->when($ageCategoryId, fn($q) => $q->where('team_members.age_category_id', $ageCategoryId))
+            ->select('team_members.id', 'team_members.name', 'team_members.contingent_id')
+            ->get()
+            ->shuffle();
+
+        if ($participants->isEmpty()) {
+            return response()->json(['message' => 'Semua peserta sudah memiliki match atau tidak ada peserta valid.'], 400);
+        }
+
+        // Cek jenis bagan
+        if ($matchChart == 2) {
+            return $this->generateSingleRoundBracket($poolId, $participants);
+        }
+
+        if ($matchChart == 6) {
+            return $this->generateBracketForSix($poolId, $participants);
+        }
+
+        if ($matchChart == 0) {
+            return $this->generateFullPrestasiBracket($poolId, $participants);
+        }
+
+        return $this->generateSingleElimination($tournamentId, $poolId, $participants, $matchChart);
     }
-
-    $tournamentId    = (int) $pool->tournament_id;
-    $matchChart      = (int) $pool->match_chart;
-    $matchCategoryId = $pool->match_category_id;
-    $categoryClassId = $pool->category_class_id;
-    $ageCategoryId   = $pool->age_category_id;
-
-    // Peserta yang SUDAH dipakai di turnamen ini (lintas pool) → exclude
-    $usedInTournament = TournamentMatch::whereHas('pool', fn($q) =>
-            $q->where('tournament_id', $tournamentId)
-        )
-        ->get(['participant_1','participant_2'])
-        ->flatMap(fn($m) => [$m->participant_1, $m->participant_2])
-        ->filter()
-        ->unique()
-        ->values();
-
-    // 🔒 Ambil peserta HANYA dari turnamen ini, pool konsisten dengan turnamen ini,
-    //     kontingen memang terdaftar di turnamen ini, dan belum kepakai turnamen-wide.
-    $participants = DB::table('tournament_participants as tp')
-        ->join('team_members as tm', 'tm.id', '=', 'tp.team_member_id')
-        // pool konsisten (LEFT JOIN pools untuk validasi konsistensi)
-        ->leftJoin('pools as p', 'p.id', '=', 'tp.pool_id')
-        ->where('tp.tournament_id', $tournamentId)
-        // pool guard: NULL atau pool milik turnamen ini
-        ->where(function ($q) use ($tournamentId) {
-            $q->whereNull('tp.pool_id')
-              ->orWhere(function ($qq) use ($tournamentId) {
-                  $qq->whereColumn('p.id', 'tp.pool_id')
-                     ->where('p.tournament_id', $tournamentId);
-              });
-        })
-        // exclude yang sudah dipakai di turnamen ini (lintas pool)
-        ->when($usedInTournament->isNotEmpty(), fn($q) =>
-            $q->whereNotIn('tm.id', $usedInTournament)
-        )
-        // filter by kategori/kelas/usia pool
-        ->when($matchCategoryId, fn($q) => $q->where('tm.match_category_id', $matchCategoryId))
-        ->when($categoryClassId, fn($q) => $q->where('tm.category_class_id', $categoryClassId))
-        ->when($ageCategoryId, fn($q) => $q->where('tm.age_category_id', $ageCategoryId))
-        // pastikan kontingen terdaftar di turnamen ini
-        ->whereExists(function ($q) use ($tournamentId) {
-            $q->select(DB::raw(1))
-              ->from('tournament_contingents as tc')
-              ->whereColumn('tc.contingent_id', 'tm.contingent_id')
-              ->where('tc.tournament_id', $tournamentId);
-        })
-        ->select(
-            'tm.id',           // === ini yang dipakai downstream
-            'tm.name',
-            'tm.contingent_id'
-        )
-        ->distinct()
-        ->get()
-        ->shuffle()
-        ->values();
-
-    if ($participants->isEmpty()) {
-        return response()->json(['message' => 'Semua peserta sudah memiliki match atau tidak ada peserta valid.'], 400);
-    }
-
-    // Cek jenis bagan
-    if ($matchChart === 2) {
-        return $this->generateSingleRoundBracket($poolId, $participants);
-    }
-
-    if ($matchChart === 6) {
-        return $this->generateBracketForSix($poolId, $participants);
-    }
-
-    if ($matchChart === 0) {
-        return $this->generateFullPrestasiBracket($poolId, $participants);
-    }
-
-    return $this->generateSingleElimination($tournamentId, $poolId, $participants, $matchChart);
-}
-
-
 
     public function regenerateBracket($poolId)
     {
-        // Bersih-bersih match existing di pool ini
         TournamentMatch::where('pool_id', $poolId)->delete();
 
-        /** @var \App\Models\Pool|null $pool */
         $pool = Pool::with(['categoryClass'])->find($poolId);
         if (!$pool) {
             return response()->json(['message' => 'Pool tidak ditemukan.'], 404);
         }
 
-        $tournamentId    = (int) $pool->tournament_id;
-        $matchChart      = (int) $pool->match_chart;
-        $matchCategoryId = $pool->match_category_id;
-        $categoryClassId = $pool->category_class_id;
-        $ageCategoryId   = $pool->age_category_id;
+        $tournamentId = $pool->tournament_id;
+        $matchChart = (int) $pool->match_chart;
 
-        // Peserta yang SUDAH dipakai di turnamen ini (lintas pool) → exclude
-        $usedInTournament = TournamentMatch::whereHas('pool', fn($q) =>
-                $q->where('tournament_id', $tournamentId)
-            )
-            ->get(['participant_1','participant_2'])
-            ->flatMap(fn($m) => [$m->participant_1, $m->participant_2])
-            ->filter()
-            ->unique()
-            ->values();
+        // Coba ambil peserta yang sudah masuk pool ini
+        $participants = collect(
+            DB::table('tournament_participants')
+                ->join('team_members', 'tournament_participants.team_member_id', '=', 'team_members.id')
+                ->where('tournament_participants.pool_id', $poolId)
+                ->select('team_members.id', 'team_members.name')
+                ->get()
+        );
 
-        // Cek apakah team_members ada kolom gender
-        $hasGenderCol = Schema::hasColumn('team_members', 'gender');
-
-        // 1) Coba ambil peserta yang memang sudah di-assign ke pool ini
-        //    (tetap validasi bahwa pool ini milik turnamen ini + kontingen terdaftar di turnamen ini)
-        $participants = DB::table('tournament_participants as tp')
-            ->join('team_members as tm', 'tp.team_member_id', '=', 'tm.id')
-            ->leftJoin('pools as p', 'p.id', '=', 'tp.pool_id')
-            ->where('tp.tournament_id', $tournamentId)
-            ->where('tp.pool_id', $poolId)
-            ->whereColumn('p.id', 'tp.pool_id')
-            ->where('p.tournament_id', $tournamentId)
-            // Exclude yang sudah dipakai turnamen-wide
-            ->when($usedInTournament->isNotEmpty(), fn($q) =>
-                $q->whereNotIn('tm.id', $usedInTournament)
-            )
-            // Filter by kategori/kelas/usia dari pool (kalau ada)
-            ->when($matchCategoryId, fn($q) => $q->where('tm.match_category_id', $matchCategoryId))
-            ->when($categoryClassId, fn($q) => $q->where('tm.category_class_id', $categoryClassId))
-            ->when($ageCategoryId, fn($q) => $q->where('tm.age_category_id', $ageCategoryId))
-            // Pastikan kontingen terdaftar di turnamen ini
-            ->whereExists(function ($q) use ($tournamentId) {
-                $q->select(DB::raw(1))
-                ->from('tournament_contingents as tc')
-                ->whereColumn('tc.contingent_id', 'tm.contingent_id')
-                ->where('tc.tournament_id', $tournamentId);
-            })
-            ->select('tm.id', 'tm.name', 'tm.contingent_id')
-            ->distinct()
-            ->get();
-
-        // 2) Kalau belum ada isinya, ambil peserta dari turnamen yang BELUM punya pool_id,
-        //    tapi pool guard wajib: tp.pool_id NULL (atau kalo ada nilai, harus milik turnamen ini),
-        //    plus semua validasi yang sama seperti (1).
+        // Kalau belum ada isinya, ambil peserta dari turnamen yg belum punya pool_id
         if ($participants->isEmpty()) {
-            $participants = DB::table('tournament_participants as tp')
-                ->join('team_members as tm', 'tp.team_member_id', '=', 'tm.id')
-                ->leftJoin('pools as p', 'p.id', '=', 'tp.pool_id')
-                ->where('tp.tournament_id', $tournamentId)
-                // Guard pool_id: NULL ATAU pool milik turnamen ini (jaga-jaga data nyasar)
-                ->where(function ($q) use ($tournamentId) {
-                    $q->whereNull('tp.pool_id')
-                    ->orWhere(function ($qq) use ($tournamentId) {
-                        $qq->whereColumn('p.id', 'tp.pool_id')
-                            ->where('p.tournament_id', $tournamentId);
-                    });
-                })
-                // Exclude yang sudah dipakai turnamen-wide
-                ->when($usedInTournament->isNotEmpty(), fn($q) =>
-                    $q->whereNotIn('tm.id', $usedInTournament)
-                )
-                // Filter by kategori/kelas/usia dari pool (kalau ada)
-                ->when($matchCategoryId, fn($q) => $q->where('tm.match_category_id', $matchCategoryId))
-                ->when($categoryClassId, fn($q) => $q->where('tm.category_class_id', $categoryClassId))
-                ->when($ageCategoryId, fn($q) => $q->where('tm.age_category_id', $ageCategoryId))
-                // Pastikan kontingen terdaftar di turnamen ini
-                ->whereExists(function ($q) use ($tournamentId) {
-                    $q->select(DB::raw(1))
-                    ->from('tournament_contingents as tc')
-                    ->whereColumn('tc.contingent_id', 'tm.contingent_id')
-                    ->where('tc.tournament_id', $tournamentId);
-                })
-                ->select('tm.id', 'tm.name', 'tm.contingent_id')
-                ->distinct()
-                ->get();
+            $participants = collect(
+                DB::table('tournament_participants')
+                    ->join('team_members', 'tournament_participants.team_member_id', '=', 'team_members.id')
+                    ->where('tournament_participants.tournament_id', $tournamentId)
+                    ->whereNull('tournament_participants.pool_id')
+                    ->select('team_members.id', 'team_members.name')
+                    ->get()
+            );
         }
 
-        // Shuffle ulang & reindex
-        $participants = collect($participants)->shuffle()->values();
+        // Shuffle ulang
+        $participants = $participants->shuffle()->values();
         $participantCount = $participants->count();
 
-        // Validasi jumlah peserta (numeric only; 0 = full_prestasi, 6 = mode khusus)
-        $specialCharts = [0, 6, 2]; // 2 kita handle khusus juga
-        if (!in_array($matchChart, $specialCharts, true) && $participantCount < $matchChart) {
+        // Validasi jumlah peserta
+        if (!in_array($matchChart, ['full_prestasi', 0, 6]) && $participantCount < $matchChart) {
             return response()->json([
                 'message' => 'Peserta tidak mencukupi untuk membuat bagan ini.',
-                'found'   => $participantCount,
-                'needed'  => $matchChart,
+                'found' => $participantCount,
+                'needed' => $matchChart
             ], 400);
         }
 
@@ -242,10 +147,8 @@ class TournamentMatchController extends Controller
             return $this->generateFullPrestasiBracket($poolId, $participants);
         }
 
-        // Fallback: eliminasi tunggal
         return $this->generateSingleElimination($tournamentId, $poolId, $participants, $matchChart);
     }
-
 
 
     private function generateSingleRoundBracket($poolId)

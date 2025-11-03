@@ -9,8 +9,6 @@ use App\Models\TeamMember;
 use App\Models\Pool;
 use App\Models\TournamentParticipant;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Schema;
-use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Faker\Factory as Faker;
 
@@ -660,272 +658,192 @@ class DrawingController extends Controller
     }
 
     public function generatePools(Request $request)
-{
-    $request->validate([
-        'tournament_id'     => 'required|exists:tournaments,id',
-        'match_category_id' => 'required|exists:match_categories,id',
-        'age_category_id'   => 'required|exists:age_categories,id',
-        'category_class_id' => 'nullable|exists:category_classes,id', // null = semua kelas
-        'match_chart'       => 'required|in:2,4,6,8,16,full_prestasi',
-        'match_duration'    => 'required|in:60,90,120,150,180,210,240,270,300',
-        'interpret_as'      => 'nullable|in:slots,pools', // default slots (kapasitas per pool)
-    ]);
+    {
+        $request->validate([
+            'tournament_id'     => 'required|exists:tournaments,id',
+            'match_category_id' => 'required|exists:match_categories,id',
+            'age_category_id'   => 'required|exists:age_categories,id',
+            'category_class_id' => 'nullable|exists:category_classes,id', // biarin null = semua kelas dalam umur tsb
+            'match_chart'       => 'required|in:2,4,6,8,16,full_prestasi',
+            'match_duration'    => 'required|in:60,90,120,150,180,210,240,270,300',
+            // optional: cara baca match_chart
+            'interpret_as'      => 'nullable|in:slots,pools', // default slots (kapasitas per pool)
+        ]);
 
-    $tournamentId    = (int) $request->tournament_id;
-    $matchCategoryId = (int) $request->match_category_id;
-    $ageCategoryId   = (int) $request->age_category_id;
-    $matchChartRaw   = $request->match_chart;
-    $matchDuration   = (int) $request->match_duration;
-    $interpretAs     = $request->input('interpret_as', 'slots');
+        $tournamentId    = (int) $request->tournament_id;
+        $matchCategoryId = (int) $request->match_category_id;
+        $ageCategoryId   = (int) $request->age_category_id;
+        $matchChartRaw   = $request->match_chart; // '2'|'4'|'6'|'8'|'16'|'full_prestasi'
+        $matchDuration   = (int) $request->match_duration;
+        $interpretAs     = $request->input('interpret_as', 'slots'); // default
 
-    // ✅ Validasi mapping kategori & usia pada turnamen
-    $hasCategory = \Illuminate\Support\Facades\DB::table('tournament_categories')
-        ->where('tournament_id', $tournamentId)
-        ->where('match_category_id', $matchCategoryId)
-        ->exists();
+        // ✅ Pastikan kategori & usia tersedia di turnamen
+        $hasCategory = DB::table('tournament_categories')
+            ->where('tournament_id', $tournamentId)
+            ->where('match_category_id', $matchCategoryId)
+            ->exists();
 
-    $hasAgeCategory = \Illuminate\Support\Facades\DB::table('tournament_age_categories')
-        ->where('tournament_id', $tournamentId)
-        ->where('age_category_id', $ageCategoryId)
-        ->exists();
+        $hasAgeCategory = DB::table('tournament_age_categories')
+            ->where('tournament_id', $tournamentId)
+            ->where('age_category_id', $ageCategoryId)
+            ->exists();
 
-    if (!$hasCategory || !$hasAgeCategory) {
-        return response()->json(['message' => 'Kategori pertandingan atau usia tidak ditemukan di turnamen ini.'], 400);
-    }
-
-    // ⛏️ PRE-CLEAN: cabut pool_id TP yang nyasar (pool hilang / pool milik turnamen lain)
-    \Illuminate\Support\Facades\DB::table('tournament_participants as tp')
-        ->leftJoin('pools as p', 'p.id', '=', 'tp.pool_id')
-        ->where('tp.tournament_id', $tournamentId)
-        ->whereNotNull('tp.pool_id')
-        ->where(function ($q) use ($tournamentId) {
-            $q->whereNull('p.id') // pool sudah tidak ada
-              ->orWhere('p.tournament_id', '<>', $tournamentId); // pool milik turnamen lain
-        })
-        ->update(['tp.pool_id' => null]);
-
-    // (Opsional) Guard kontingen dipakai hanya bila tabel & data ada
-    $useContingentGuard = \Illuminate\Support\Facades\Schema::hasTable('tournament_contingents') &&
-        \Illuminate\Support\Facades\DB::table('tournament_contingents')->where('tournament_id', $tournamentId)->exists();
-
-    // ===== Ambil daftar kelas via TP (STRICT: harus terdaftar di turnamen ini) =====
-    if ($request->filled('category_class_id')) {
-        $categoryClassIds = [(int) $request->category_class_id];
-    } else {
-        $qClass = \Illuminate\Support\Facades\DB::table('team_members as tm')
-            ->join('tournament_participants as tp', 'tm.id', '=', 'tp.team_member_id')
-            ->where('tp.tournament_id', $tournamentId)
-            ->where('tm.match_category_id', $matchCategoryId)
-            ->where('tm.age_category_id', $ageCategoryId);
-
-        if ($useContingentGuard) {
-            $qClass->whereExists(function ($q) use ($tournamentId) {
-                $q->select(\Illuminate\Support\Facades\DB::raw(1))
-                  ->from('tournament_contingents as tc')
-                  ->whereColumn('tc.contingent_id', 'tm.contingent_id')
-                  ->where('tc.tournament_id', $tournamentId);
-            });
+        if (!$hasCategory || !$hasAgeCategory) {
+            return response()->json(['message' => 'Kategori pertandingan atau usia tidak ditemukan di turnamen ini.'], 400);
         }
 
-        $categoryClassIds = $qClass->pluck('tm.category_class_id')
-            ->unique()->filter()->values()->toArray();
-    }
-
-    if (empty($categoryClassIds)) {
-        \Illuminate\Support\Facades\Log::warning('[Pools][DEBUG] empty categoryClassIds', compact('tournamentId','matchCategoryId','ageCategoryId'));
-        return response()->json(['message' => 'Tidak ada kelas yang ditemukan untuk turnamen ini.'], 400);
-    }
-
-    $result = [];
-    \Illuminate\Support\Facades\DB::beginTransaction();
-
-    try {
-        foreach ($categoryClassIds as $categoryClassId) {
-            // 1) BASE SET: peserta di turnamen ini (MC, Age, Class) — via TP
-            $baseIds = \Illuminate\Support\Facades\DB::table('team_members as tm')
+        // ✅ Ambil daftar kelas (per umur) yang punya peserta terdaftar di turnamen
+        $categoryClassIds = $request->filled('category_class_id')
+            ? [(int) $request->category_class_id]
+            : DB::table('team_members as tm')
                 ->join('tournament_participants as tp', 'tm.id', '=', 'tp.team_member_id')
                 ->where('tp.tournament_id', $tournamentId)
                 ->where('tm.match_category_id', $matchCategoryId)
                 ->where('tm.age_category_id', $ageCategoryId)
-                ->where('tm.category_class_id', (int) $categoryClassId)
-                ->pluck('tm.id')->unique()->values()->toArray();
+                ->pluck('tm.category_class_id')
+                ->unique()
+                ->filter() // buang null
+                ->values()
+                ->toArray();
 
-            \Illuminate\Support\Facades\Log::info('[Pools][DEBUG] baseIds', [
-                'tournamentId' => $tournamentId,
-                'matchCategoryId' => $matchCategoryId,
-                'ageCategoryId' => $ageCategoryId,
-                'categoryClassId' => (int)$categoryClassId,
-                'base_count' => count($baseIds),
-            ]);
+        if (empty($categoryClassIds)) {
+            return response()->json(['message' => 'Tidak ada kelas yang ditemukan untuk turnamen ini.'], 400);
+        }
 
-            if (count($baseIds) === 0) {
-                continue;
-            }
+        $result = [];
 
-            // 2) POOL GUARD: hanya TP yang pool_id NULL atau pool milik turnamen ini
-            $poolSafeIds = \Illuminate\Support\Facades\DB::table('tournament_participants as tp')
-                ->leftJoin('pools as pl', 'pl.id', '=', 'tp.pool_id')
-                ->where('tp.tournament_id', $tournamentId)
-                ->whereIn('tp.team_member_id', $baseIds)
-                ->where(function ($w) use ($tournamentId) {
-                    $w->whereNull('tp.pool_id')
-                      ->orWhere(function ($ww) use ($tournamentId) {
-                          $ww->whereColumn('pl.id', 'tp.pool_id')
-                             ->where('pl.tournament_id', $tournamentId);
-                      });
-                })
-                ->pluck('tp.team_member_id')->unique()->values()->toArray();
+        DB::beginTransaction();
+        try {
+            foreach ($categoryClassIds as $categoryClassId) {
+                // 🔎 Peserta valid di kelas ini (yang terdaftar di turnamen)
+                $teamMemberIds = DB::table('team_members as tm')
+                    ->join('tournament_participants as tp', 'tm.id', '=', 'tp.team_member_id')
+                    ->where('tp.tournament_id', $tournamentId)
+                    ->where('tm.match_category_id', $matchCategoryId)
+                    ->where('tm.age_category_id', $ageCategoryId)
+                    ->where('tm.category_class_id', $categoryClassId)
+                    ->pluck('tm.id')
+                    ->unique()
+                    ->values()
+                    ->toArray();
 
-            \Illuminate\Support\Facades\Log::info('[Pools][DEBUG] after poolGuard', [
-                'pool_guard_count' => count($poolSafeIds),
-                'lost_by_pool_guard' => array_values(array_diff($baseIds, $poolSafeIds)),
-            ]);
+                $totalParticipant = count($teamMemberIds);
+                if ($totalParticipant === 0) {
+                    continue;
+                }
 
-            if (count($poolSafeIds) === 0) {
-                continue;
-            }
+                // 🧹 Reset pool_id tp + hapus pool & match lama utk scope (turnamen+kategori+usia+kelas) ini
+                TournamentParticipant::where('tournament_id', $tournamentId)
+                    ->whereIn('team_member_id', $teamMemberIds)
+                    ->update(['pool_id' => null]);
 
-            // 3) (Opsional) CONTINGENT GUARD
-            $finalIds = $poolSafeIds;
-            if ($useContingentGuard) {
-                $finalIds = \Illuminate\Support\Facades\DB::table('team_members as tm')
-                    ->whereIn('tm.id', $poolSafeIds)
-                    ->whereExists(function ($q) use ($tournamentId) {
-                        $q->select(\Illuminate\Support\Facades\DB::raw(1))
-                          ->from('tournament_contingents as tc')
-                          ->whereColumn('tc.contingent_id', 'tm.contingent_id')
-                          ->where('tc.tournament_id', $tournamentId);
-                    })
-                    ->pluck('tm.id')->unique()->values()->toArray();
+                $oldPoolIds = DB::table('pools')
+                    ->where('tournament_id', $tournamentId)
+                    ->where('match_category_id', $matchCategoryId)
+                    ->where('age_category_id', $ageCategoryId)
+                    ->where('category_class_id', $categoryClassId)
+                    ->pluck('id');
 
-                \Illuminate\Support\Facades\Log::info('[Pools][DEBUG] after contingentGuard', [
-                    'contingent_guard' => true,
-                    'final_count' => count($finalIds),
-                    'lost_by_contingent_guard' => array_values(array_diff($poolSafeIds, $finalIds)),
-                ]);
-            } else {
-                \Illuminate\Support\Facades\Log::info('[Pools][DEBUG] contingentGuard skipped (no data/table)');
-            }
-
-            if (count($finalIds) === 0) {
-                continue;
-            }
-
-            // 4) RESET tp.pool_id untuk FINAL SET saja (agar assign ulang aman)
-            \Illuminate\Support\Facades\DB::table('tournament_participants')
-                ->where('tournament_id', $tournamentId)
-                ->whereIn('team_member_id', $finalIds)
-                ->update(['pool_id' => null]);
-
-            // 5) Hapus pool & match lama utk scope (turnamen + MC + Age + Class) ini
-            $oldPoolIds = \Illuminate\Support\Facades\DB::table('pools')
-                ->where('tournament_id', $tournamentId)
-                ->where('match_category_id', $matchCategoryId)
-                ->where('age_category_id', $ageCategoryId)
-                ->where('category_class_id', (int) $categoryClassId)
-                ->pluck('id');
-
-            if ($oldPoolIds->isNotEmpty()) {
-                $oldMatchIds = \Illuminate\Support\Facades\DB::table('tournament_matches')->whereIn('pool_id', $oldPoolIds)->pluck('id');
-                if ($oldMatchIds->isNotEmpty()) {
-                    if (\Illuminate\Support\Facades\Schema::hasTable('match_schedule_details') &&
-                        \Illuminate\Support\Facades\Schema::hasColumn('match_schedule_details', 'tournament_match_id')) {
-                        \Illuminate\Support\Facades\DB::table('match_schedule_details')->whereIn('tournament_match_id', $oldMatchIds)->delete();
+                if ($oldPoolIds->isNotEmpty()) {
+                    $oldMatchIds = DB::table('tournament_matches')->whereIn('pool_id', $oldPoolIds)->pluck('id');
+                    if ($oldMatchIds->isNotEmpty()) {
+                        if (Schema::hasTable('match_schedule_details') &&
+                            Schema::hasColumn('match_schedule_details', 'tournament_match_id')) {
+                            DB::table('match_schedule_details')->whereIn('tournament_match_id', $oldMatchIds)->delete();
+                        }
+                        DB::table('tournament_matches')->whereIn('id', $oldMatchIds)->delete();
                     }
-                    \Illuminate\Support\Facades\DB::table('tournament_matches')->whereIn('id', $oldMatchIds)->delete();
+                    DB::table('pools')->whereIn('id', $oldPoolIds)->delete();
                 }
-                \Illuminate\Support\Facades\DB::table('pools')->whereIn('id', $oldPoolIds)->delete();
-            }
 
-            // 6) Hitung jumlah pool
-            $totalParticipant = count($finalIds);
-            if ($matchChartRaw === 'full_prestasi' || (int)$matchChartRaw === 2) {
-                $totalPools   = 1;
-                $slotsPerPool = $matchChartRaw === 'full_prestasi' ? 0 : (int) $matchChartRaw;
-            } else {
-                if ($interpretAs === 'pools') {
-                    $totalPools   = max(1, (int) $matchChartRaw); // match_chart = JUMLAH POOL
-                    $slotsPerPool = null;
+                // 🧮 Hitung jumlah pool PER KELAS
+                if ($matchChartRaw === 'full_prestasi' || (int)$matchChartRaw === 2) {
+                    $totalPools = 1; // full prestasi / 2 peserta: 1 pool
+                    $slotsPerPool = $matchChartRaw === 'full_prestasi' ? 0 : (int) $matchChartRaw;
                 } else {
-                    $slotsPerPool = max(1, (int) $matchChartRaw); // match_chart = SLOT PER POOL
-                    $totalPools   = (int) ceil($totalParticipant / $slotsPerPool);
+                    if ($interpretAs === 'pools') {
+                        // match_chart = JUMLAH POOL per kelas
+                        $totalPools   = max(1, (int) $matchChartRaw);
+                        $slotsPerPool = null; // info
+                    } else {
+                        // match_chart = SLOT PER POOL (default)
+                        $slotsPerPool = max(1, (int) $matchChartRaw); // 4/6/8/16
+                        $totalPools   = (int) ceil($totalParticipant / $slotsPerPool);
+                    }
                 }
-            }
 
-            // 7) Buat pool baru
-            $toInsert = [];
-            for ($i = 1; $i <= $totalPools; $i++) {
-                $toInsert[] = [
-                    'tournament_id'     => $tournamentId,
-                    'match_category_id' => $matchCategoryId,
-                    'age_category_id'   => $ageCategoryId,
-                    'category_class_id' => (int) $categoryClassId,
-                    'match_chart'       => is_numeric($matchChartRaw) ? (int) $matchChartRaw : 0,
-                    'match_duration'    => $matchDuration,
-                    'name'              => "Pool {$i}",
-                    'created_at'        => now(),
-                    'updated_at'        => now(),
+                // 🧱 Buat pool utk kelas ini
+                $toInsert = [];
+                for ($i = 1; $i <= $totalPools; $i++) {
+                    $toInsert[] = [
+                        'tournament_id'     => $tournamentId,
+                        'match_category_id' => $matchCategoryId,
+                        'age_category_id'   => $ageCategoryId,
+                        'category_class_id' => $categoryClassId,
+                        'match_chart'       => is_numeric($matchChartRaw) ? (int) $matchChartRaw : 0,
+                        'match_duration'    => $matchDuration,
+                        'name'              => "Pool {$i}",
+                        'created_at'        => now(),
+                        'updated_at'        => now(),
+                    ];
+                }
+                DB::table('pools')->insert($toInsert);
+
+                // Ambil kembali ID pool yang barusan dibuat (urut nama)
+                $poolRows = DB::table('pools')
+                    ->where('tournament_id', $tournamentId)
+                    ->where('match_category_id', $matchCategoryId)
+                    ->where('age_category_id', $ageCategoryId)
+                    ->where('category_class_id', $categoryClassId)
+                    ->orderBy('name')
+                    ->get(['id','name']);
+
+                // 🔁 Assign peserta → pool (round-robin per kelas)
+                // Bisa lebih rapi pakai shuffle lalu modulo ke jumlah pool
+                $tmIds = $teamMemberIds;
+                shuffle($tmIds);
+
+                $poolIds = $poolRows->pluck('id')->values()->all();
+                $pCount  = count($poolIds);
+                $assigns = [];
+
+                foreach ($tmIds as $idx => $tmId) {
+                    $poolIndex = $idx % $pCount;
+                    $assigns[$poolIds[$poolIndex]][] = $tmId;
+                }
+
+                // Bulk update tp.pool_id per pool
+                foreach ($assigns as $pid => $tmList) {
+                    TournamentParticipant::where('tournament_id', $tournamentId)
+                        ->whereIn('team_member_id', $tmList)
+                        ->update(['pool_id' => $pid]);
+                }
+
+                $result[] = [
+                    'category_class_id' => $categoryClassId,
+                    'total_participant' => $totalParticipant,
+                    'total_pools'       => $totalPools,
+                    'mode'              => $interpretAs,
+                    'slots_per_pool'    => $slotsPerPool,
+                    'pools'             => $poolRows,
                 ];
             }
-            \Illuminate\Support\Facades\DB::table('pools')->insert($toInsert);
 
-            $poolRows = \Illuminate\Support\Facades\DB::table('pools')
-                ->where('tournament_id', $tournamentId)
-                ->where('match_category_id', $matchCategoryId)
-                ->where('age_category_id', $ageCategoryId)
-                ->where('category_class_id', (int) $categoryClassId)
-                ->orderBy('name')
-                ->get(['id','name']);
-
-            // 8) Assign peserta → pool (round-robin)
-            $tmIds = $finalIds;
-            shuffle($tmIds);
-
-            $poolIds = $poolRows->pluck('id')->values()->all();
-            $pCount  = count($poolIds);
-            $assigns = [];
-
-            foreach ($tmIds as $idx => $tmId) {
-                $poolIndex = $idx % $pCount;
-                $assigns[$poolIds[$poolIndex]][] = $tmId;
+            if (empty($result)) {
+                DB::rollBack();
+                return response()->json(['message' => 'Tidak ada pool yang dibuat karena tidak ada peserta yang valid.'], 400);
             }
 
-            foreach ($assigns as $pid => $tmList) {
-                \Illuminate\Support\Facades\DB::table('tournament_participants')
-                    ->where('tournament_id', $tournamentId)
-                    ->whereIn('team_member_id', $tmList)
-                    ->update(['pool_id' => $pid]);
-            }
-
-            $result[] = [
-                'category_class_id' => (int) $categoryClassId,
-                'total_participant' => $totalParticipant,
-                'total_pools'       => $totalPools,
-                'mode'              => $interpretAs,
-                'slots_per_pool'    => $slotsPerPool,
-                'pools'             => $poolRows,
-            ];
+            DB::commit();
+            return response()->json([
+                'message' => 'Pools berhasil dibuat per kelas dalam kategori umur.',
+                'data'    => $result
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json(['error' => $e->getMessage()], 500);
         }
-
-        if (empty($result)) {
-            \Illuminate\Support\Facades\DB::rollBack();
-            return response()->json(['message' => 'Tidak ada pool yang dibuat karena tidak ada peserta yang valid.'], 400);
-        }
-
-        \Illuminate\Support\Facades\DB::commit();
-        return response()->json([
-            'message' => 'Pools berhasil dibuat per kelas dalam kategori umur.',
-            'data'    => $result
-        ]);
-    } catch (\Throwable $e) {
-        \Illuminate\Support\Facades\DB::rollBack();
-        \Illuminate\Support\Facades\Log::error('[Pools][ERROR] '.$e->getMessage(), ['trace' => $e->getTraceAsString()]);
-        return response()->json(['error' => $e->getMessage()], 500);
     }
-}
-
-
-
 
 
 
@@ -1044,7 +962,7 @@ class DrawingController extends Controller
     $filterTournamentId = $request->query('tournament_id');
 
     // Query pool + relasi
-    $poolQuery = \App\Models\Pool::with([
+    $poolQuery = Pool::with([
         'tournament:id,name',
         'matchCategory:id,name',
         'ageCategory:id,name',
@@ -1071,40 +989,13 @@ class DrawingController extends Controller
     $tournamentIds    = $pools->pluck('tournament_id')->unique()->values();
     $matchCategoryIds = $pools->pluck('match_category_id')->unique()->filter()->values();
 
-    // Apakah kita mau jaga kontingen yang terdaftar di turnamen? (opsional, aktif kalau tabel & data ada)
-    $useContingentGuard = \Illuminate\Support\Facades\Schema::hasTable('tournament_contingents')
-        && \Illuminate\Support\Facades\DB::table('tournament_contingents')
-            ->whereIn('tournament_id', $tournamentIds)->exists();
-
-    // ====== Guard umum: hanya hitung TP di turnamen yang sama,
-    //        dan jika TP.pool_id terisi maka pool itu harus milik turnamen yang sama (pool guard)
-    $poolGuard = function ($q) {
-        $q->whereNull('tp.pool_id')
-          ->orWhere(function ($qq) {
-              $qq->whereColumn('pl.id', 'tp.pool_id')
-                 ->whereColumn('pl.tournament_id', 'tp.tournament_id');
-          });
-    };
-
     // ====== Preload jumlah atlet per (tournament_id, match_category_id, category_class_id)
-    $qClass = \Illuminate\Support\Facades\DB::table('tournament_participants as tp')
+    $byClass = DB::table('tournament_participants as tp')
         ->join('team_members as tm', 'tm.id', '=', 'tp.team_member_id')
-        ->leftJoin('pools as pl', 'pl.id', '=', 'tp.pool_id')
         ->whereIn('tp.tournament_id', $tournamentIds)
+        // Filter hanya match_category yang dipakai minimal di salah satu pool (hemat)
         ->when($matchCategoryIds->isNotEmpty(), fn($q) => $q->whereIn('tm.match_category_id', $matchCategoryIds))
         ->whereNotNull('tm.category_class_id')
-        ->where(function ($w) use ($poolGuard) { $poolGuard($w); });
-
-    if ($useContingentGuard) {
-        $qClass->whereExists(function ($q) {
-            $q->select(\Illuminate\Support\Facades\DB::raw(1))
-              ->from('tournament_contingents as tc')
-              ->whereColumn('tc.contingent_id', 'tm.contingent_id')
-              ->whereColumn('tc.tournament_id', 'tp.tournament_id');
-        });
-    }
-
-    $byClass = $qClass
         ->groupBy('tp.tournament_id', 'tm.match_category_id', 'tm.category_class_id')
         ->selectRaw('tp.tournament_id, tm.match_category_id, tm.category_class_id, COUNT(DISTINCT tm.id) as c')
         ->get()
@@ -1115,24 +1006,11 @@ class DrawingController extends Controller
         }, []);
 
     // ====== Preload jumlah atlet per (tournament_id, match_category_id, age_category_id)
-    $qAge = \Illuminate\Support\Facades\DB::table('tournament_participants as tp')
+    $byAge = DB::table('tournament_participants as tp')
         ->join('team_members as tm', 'tm.id', '=', 'tp.team_member_id')
-        ->leftJoin('pools as pl', 'pl.id', '=', 'tp.pool_id')
         ->whereIn('tp.tournament_id', $tournamentIds)
         ->when($matchCategoryIds->isNotEmpty(), fn($q) => $q->whereIn('tm.match_category_id', $matchCategoryIds))
         ->whereNotNull('tm.age_category_id')
-        ->where(function ($w) use ($poolGuard) { $poolGuard($w); });
-
-    if ($useContingentGuard) {
-        $qAge->whereExists(function ($q) {
-            $q->select(\Illuminate\Support\Facades\DB::raw(1))
-              ->from('tournament_contingents as tc')
-              ->whereColumn('tc.contingent_id', 'tm.contingent_id')
-              ->whereColumn('tc.tournament_id', 'tp.tournament_id');
-        });
-    }
-
-    $byAge = $qAge
         ->groupBy('tp.tournament_id', 'tm.match_category_id', 'tm.age_category_id')
         ->selectRaw('tp.tournament_id, tm.match_category_id, tm.age_category_id, COUNT(DISTINCT tm.id) as c')
         ->get()
@@ -1144,14 +1022,13 @@ class DrawingController extends Controller
 
     // Transform hasil
     $pools = $pools->map(function ($pool) use ($byClass, $byAge) {
-        $tid           = (int) $pool->tournament_id;
-        $matchCatId    = (int) ($pool->match_category_id ?? 0);
+        $tid           = (int)$pool->tournament_id;
+        $matchCatId    = (int)($pool->match_category_id ?? 0);
         $class         = $pool->categoryClass;
         $classId       = $class?->id;
         $ageCategoryId = $pool->age_category_id;
 
         // Hitung available hanya untuk turnamen & match_category yang sama
-        // (dikencengin dengan pool guard & contingent guard di query preload)
         if ($classId) {
             $available = $byClass[$tid][$matchCatId][$classId] ?? 0;
         } else {
@@ -1165,11 +1042,11 @@ class DrawingController extends Controller
             'match_category'   => $pool->matchCategory->name ?? null,
             'age_category'     => $pool->ageCategory->name ?? null,
             'category_class'   => [
-                'id'               => $classId,
-                'name'             => $class?->name,
-                'gender'           => $class?->gender,
-                'weight_min'       => $class?->weight_min,
-                'weight_max'       => $class?->weight_max,
+                'id'         => $classId,
+                'name'       => $class?->name,
+                'gender'     => $class?->gender,
+                'weight_min' => $class?->weight_min,
+                'weight_max' => $class?->weight_max,
                 'available_athletes' => $available,
             ],
             'name'             => $pool->name,
@@ -1183,7 +1060,6 @@ class DrawingController extends Controller
         'data'    => $pools,
     ]);
 }
-
 
 
     public function getPools____(Request $request)
