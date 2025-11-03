@@ -803,7 +803,7 @@ class TournamentMatchController extends Controller
     
     
 
-   private function generateBracketForSix($poolId, $participants)
+   private function generateBracketForSix_ada_dummy_kalo_1($poolId, $participants)
     {
         return DB::transaction(function () use ($poolId, $participants) {
             TournamentMatch::where('pool_id', $poolId)->delete();
@@ -1021,6 +1021,152 @@ class TournamentMatchController extends Controller
             ]);
         });
     }
+
+    private function generateBracketForSix($poolId, $participants)
+{
+    return DB::transaction(function () use ($poolId, $participants) {
+        TournamentMatch::where('pool_id', $poolId)->delete();
+
+        $pool = Pool::with('tournament')->find($poolId);
+        if (!$pool) {
+            return response()->json(['message' => 'Pool tidak ditemukan.'], 404);
+        }
+
+        // Hindari peserta yang sudah dipakai di pool lain di turnamen yang sama
+        $usedParticipantIds = TournamentMatch::whereHas('pool', fn($q) =>
+            $q->where('tournament_id', $pool->tournament_id)
+        )->pluck('participant_1')
+        ->merge(
+            TournamentMatch::whereHas('pool', fn($q) =>
+                $q->where('tournament_id', $pool->tournament_id)
+            )->pluck('participant_2')
+        )->unique();
+
+        $participants = $participants->reject(fn($p) => $usedParticipantIds->contains($p->id))->values();
+
+        // Ambil maksimal 6 untuk pool ini
+        $selected       = $participants->slice(0, 6)->values();
+        $participantIds = $selected->pluck('id')->toArray();
+
+        // Assign ke pool ini
+        TournamentParticipant::whereIn('team_member_id', $participantIds)
+            ->where('tournament_id', $pool->tournament_id)
+            ->update(['pool_id' => $poolId]);
+
+        // --- Hapus pembuatan dummy sepenuhnya ---
+
+        // Handle khusus 5 & 6 peserta (tanpa dummy, sesuai sebelumnya)
+        if ($selected->count() === 5) {
+            return $this->generateBracketForFive($poolId, $selected);
+        }
+
+        if ($selected->count() === 6) {
+            $rounds = $this->generateDefaultSix($poolId, $selected);
+            return response()->json([
+                'message' => 'Bracket untuk 6 peserta berhasil dibuat.',
+                'rounds'  => $rounds,
+            ]);
+        }
+
+        // ========== Generic builder untuk jumlah selain 5/6 ==========
+        $matchNumber = 1;
+        $matchMap = [];
+        $queue = $selected->pluck('id')->toArray();
+        $selectedCount = count($queue);
+
+        // Slot nearest power of two
+        $slot     = pow(2, ceil(log(max(count($queue), 2), 2)));
+        $maxRound = (int) ceil(log($slot, 2));
+        $byeCount = $slot - count($queue);
+
+        // Tambah BYE (null) untuk genapin power-of-two
+        for ($i = 0; $i < $byeCount; $i++) {
+            $queue[] = null;
+        }
+
+        // ROUND 1
+        for ($i = 0; $i < count($queue); $i += 2) {
+            $p1 = $queue[$i] ?? null;
+            $p2 = $queue[$i + 1] ?? null;
+
+            // Default: auto-advance jika salah satu null
+            $winner = ($p1 && !$p2) ? $p1 : (($p2 && !$p1) ? $p2 : null);
+
+            // EXCEPTION: jika total peserta cuma 1 orang di pool ini,
+            // jangan auto-advance. Lawannya TBD → winner_id = null.
+            if ($selectedCount === 1 && (($p1 && !$p2) || ($p2 && !$p1))) {
+                $winner = null;
+            }
+
+            $matchId = DB::table('tournament_matches')->insertGetId([
+                'pool_id'       => $poolId,
+                'round'         => 1,
+                'round_label'   => $this->getRoundLabel(1, $maxRound),
+                'match_number'  => $matchNumber++,
+                'participant_1' => $p1,
+                'participant_2' => $p2,
+                'winner_id'     => $winner,
+                'created_at'    => now(),
+                'updated_at'    => now(),
+            ]);
+
+            $matchMap[] = [
+                'id'     => $matchId,
+                'winner' => $winner,
+            ];
+        }
+
+        // ROUNDS 2+
+        while (count($matchMap) > 1) {
+            $nextRound    = [];
+            $currentRound = ceil(log($slot, 2)) - ceil(log(count($matchMap), 2)) + 1;
+
+            foreach (array_chunk($matchMap, 2) as $pair) {
+                $blue = $pair[0];
+                $red  = $pair[1] ?? ['id' => null, 'winner' => null];
+
+                $matchId = DB::table('tournament_matches')->insertGetId([
+                    'pool_id'              => $poolId,
+                    'round'                => $currentRound,
+                    'round_label'          => $this->getRoundLabel($currentRound, $maxRound),
+                    'match_number'         => $matchNumber++,
+                    'participant_1'        => $blue['winner'],
+                    'participant_2'        => $red['winner'],
+                    'winner_id'            => null,
+                    'parent_match_blue_id' => $blue['id'],
+                    'parent_match_red_id'  => $red['id'],
+                    'created_at'           => now(),
+                    'updated_at'           => now(),
+                ]);
+
+                if ($blue['id']) {
+                    DB::table('tournament_matches')->where('id', $blue['id'])->update(['next_match_id' => $matchId]);
+                }
+                if ($red['id']) {
+                    DB::table('tournament_matches')->where('id', $red['id'])->update(['next_match_id' => $matchId]);
+                }
+
+                $nextRound[] = [
+                    'id'     => $matchId,
+                    'winner' => null,
+                ];
+            }
+
+            $matchMap = $nextRound;
+        }
+
+        $inserted = TournamentMatch::where('pool_id', $poolId)
+            ->orderBy('round')
+            ->orderBy('match_number')
+            ->get();
+
+        return response()->json([
+            'message' => 'Bracket untuk ' . $selected->count() . ' peserta berhasil dibuat (tanpa dummy; BYE aktif, 1 peserta lawan TBD).',
+            'rounds'  => $inserted,
+        ]);
+    });
+}
+
 
 
 
