@@ -195,7 +195,7 @@ class DrawingController extends Controller
         $dummyName = $first . ' ' . $last;
 
         // Konstanta dummy
-        $contingentId = 127;
+        $contingentId = 472;
         $matchCategoryId = $original->match_category_id;
         $ageCategoryId = $original->age_category_id;
         $categoryClassId = $original->category_class_id;
